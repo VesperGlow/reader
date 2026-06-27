@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>阅读 · 页间</title>
+  <link rel="stylesheet" href="/app.css?v=14">
+</head>
+<body class="reading-body">
+  <header class="reader-bar">
+    <a href="/" class="reader-back" aria-label="返回书架">←</a>
+    <div><strong id="reader-title">正在打开…</strong><small id="reader-kind"></small></div>
+    <button class="reader-menu" id="toc-button" aria-label="打开目录" aria-expanded="false">☰</button>
+  </header>
+  <main id="viewport" class="reader-viewport">
+    <div id="loading" class="reader-loading">正在打开书页…</div>
+    <div id="reader-page" class="reader-page"></div>
+    <button id="prev-zone" class="page-zone prev-zone" aria-label="上一页"></button>
+    <button id="center-zone" class="page-zone center-zone" aria-label="显示或隐藏工具栏"></button>
+    <button id="next-zone" class="page-zone next-zone" aria-label="下一页"></button>
+  </main>
+  <div id="toc-scrim" class="toc-scrim hidden"></div>
+  <aside id="toc-drawer" class="toc-drawer" aria-label="书籍目录" aria-hidden="true">
+    <div class="toc-heading"><div><small>CONTENTS</small><h2>目录</h2></div><button id="toc-close" aria-label="关闭目录">×</button></div>
+    <nav id="toc-list" class="toc-list"></nav>
+    <div class="toc-actions"><button id="theme-button">◐ 切换明暗</button></div>
+  </aside>
+  <footer class="reader-footer"><span id="page-label">— / — · 0%</span><span>左右翻页 · 中间显示工具栏</span></footer>
+  <script src="/vendor/jszip.min.js?v=3.10.1"></script>
+  <script src="/reader-cache.js?v=1" defer></script>
+  <script src="/reader.js?v=14" defer></script>
+</body>
+</html>

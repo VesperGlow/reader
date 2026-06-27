@@ -1,0 +1,12 @@
+services:
+  reader:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - reader-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  reader-data:
+

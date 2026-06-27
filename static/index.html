@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>页间 · 我的书架</title>
+  <link rel="stylesheet" href="/app.css?v=14">
+</head>
+<body>
+  <main id="auth" class="auth-shell hidden">
+    <section class="auth-card">
+      <div class="brand-mark">页</div>
+      <p class="eyebrow">PRIVATE READER</p>
+      <h1 id="auth-title">回到你的书架</h1>
+      <p class="muted" id="auth-copy">登录后继续安静阅读。</p>
+      <form id="auth-form">
+        <label>用户名<input id="username" autocomplete="username" minlength="3" maxlength="32" required></label>
+        <label>密码<input id="password" type="password" autocomplete="current-password" minlength="8" maxlength="128" required></label>
+        <button class="primary wide" id="auth-submit">登录</button>
+      </form>
+      <p class="error" id="auth-error"></p>
+    </section>
+  </main>
+
+  <!-- 主视图：书架 -->
+  <main id="shelf-view" class="hidden">
+    <header class="topbar library-topbar">
+      <a class="logo" href="/"><span>页</span> 页间</a>
+      <div class="top-actions">
+        <span class="muted" id="welcome"></span>
+        <label class="upload-button">＋ 添加书籍<input id="file-input" type="file" accept=".epub,.txt" hidden></label>
+        <button class="ghost" id="logout">退出</button>
+      </div>
+    </header>
+    <div class="library-layout">
+      <aside class="library-directory" aria-label="书架目录">
+        <div class="directory-heading"><span>目录</span><small id="book-count"></small></div>
+        <nav id="library-filters">
+          <button class="directory-item active" data-filter="all"><span>全部书籍</span><b id="count-all">0</b></button>
+          <button class="directory-item" data-filter="epub"><span>EPUB</span><b id="count-epub">0</b></button>
+          <button class="directory-item" data-filter="txt"><span>TXT</span><b id="count-txt">0</b></button>
+          <button class="directory-item" data-filter="recent"><span>最近添加</span><b id="count-recent">0</b></button>
+        </nav>
+        <p class="directory-note">封面优先读取 EPUB 内嵌图片，书籍文件只保存在你的空间。</p>
+      </aside>
+      <section class="shelf-wrap">
+        <div class="section-title">
+          <button id="series-back" class="series-back hidden" aria-label="返回书架">←</button>
+          <div><p class="eyebrow">MY LIBRARY</p><h1 id="shelf-title">书架</h1></div>
+          <span id="visible-count"></span>
+        </div>
+        <div id="uploading" class="uploading hidden">正在把书放上书架…</div>
+        <div id="books" class="book-grid"></div>
+        <div id="empty" class="empty hidden">
+          <div class="empty-icon">＋</div><h3>书架还是空的</h3><p>添加一本 EPUB 或 TXT，开始第一次阅读。</p>
+        </div>
+        <div id="no-results" class="empty hidden"><h3>没有找到书籍</h3><p>换一个目录或搜索词试试。</p></div>
+      </section>
+    </div>
+    <button id="shelf-menu-button" class="shelf-menu-button" aria-label="打开书架菜单" aria-expanded="false">‹</button>
+    <div id="shelf-scrim" class="shelf-scrim hidden"></div>
+    <aside id="shelf-drawer" class="shelf-drawer" aria-label="书架菜单" aria-hidden="true">
+      <div class="drawer-heading"><div><small>LIBRARY</small><h2>书架工具</h2></div><button id="shelf-drawer-close" aria-label="关闭菜单">×</button></div>
+      <div class="drawer-content">
+        <label class="drawer-search"><span>搜索书籍</span><input id="book-search" type="search" placeholder="输入书名、作者或系列" autocomplete="off"></label>
+        <div class="drawer-actions">
+          <label class="drawer-action">＋<span><strong>添加 / 导入书籍</strong><small>支持 EPUB、TXT</small></span><input id="drawer-file-input" type="file" accept=".epub,.txt" hidden></label>
+          <button class="drawer-action" id="manage-books">✓<span><strong>删除书籍 / 批量管理</strong><small>选择多本书后删除</small></span></button>
+          <button class="drawer-action" id="edit-shelf">✎<span><strong>编辑书架</strong><small>修改书名、作者与系列</small></span></button>
+          <button class="drawer-action" id="settings-button">⚙<span><strong>设置</strong><small>显示与账户设置</small></span></button>
+        </div>
+        <div id="settings-panel" class="settings-panel hidden">
+          <label><input id="compact-shelf" type="checkbox"> 紧凑书架</label>
+          <button id="drawer-logout" class="ghost">退出登录</button>
+        </div>
+      </div>
+    </aside>
+    <div id="batch-bar" class="batch-bar hidden"><span id="selected-count">已选择 0 本</span><button id="cancel-manage" class="ghost">取消</button><button id="confirm-delete" class="primary">删除</button></div>
+    <dialog id="book-editor" class="book-editor">
+      <form id="book-editor-form">
+        <div class="editor-heading"><h2>编辑书籍</h2><button type="button" id="editor-close" aria-label="关闭">×</button></div>
+        <input id="editor-book-id" type="hidden">
+        <label>书名<input id="editor-title" maxlength="240" required></label>
+        <label>作者<input id="editor-author" maxlength="160"></label>
+        <label>系列名称<input id="editor-series" maxlength="200"></label>
+        <label>系列序号<input id="editor-series-index" type="number" min="0" step="0.1"></label>
+        <button class="primary wide">保存</button>
+      </form>
+    </dialog>
+  </main>
+
+  <!-- 主视图：阅读器（embedded） -->
+  <section id="reader-view" class="reader-shell hidden">
+    <header class="reader-bar">
+      <button id="reader-back" class="reader-back" aria-label="返回书架">←</button>
+      <div><strong id="reader-title">正在打开…</strong><small id="reader-kind"></small></div>
+      <button class="reader-menu" id="toc-button" aria-label="打开目录" aria-expanded="false">☰</button>
+    </header>
+    <main id="viewport" class="reader-viewport">
+      <div id="loading" class="reader-loading">正在打开书页…</div>
+      <div id="reader-page" class="reader-page"></div>
+      <button id="prev-zone" class="page-zone prev-zone" aria-label="上一页"></button>
+      <button id="center-zone" class="page-zone center-zone" aria-label="显示或隐藏工具栏"></button>
+      <button id="next-zone" class="page-zone next-zone" aria-label="下一页"></button>
+    </main>
+    <div id="toc-scrim" class="toc-scrim hidden"></div>
+    <aside id="toc-drawer" class="toc-drawer" aria-label="书籍目录" aria-hidden="true">
+      <div class="toc-heading"><div><small>CONTENTS</small><h2>目录</h2></div><button id="toc-close" aria-label="关闭目录">×</button></div>
+      <nav id="toc-list" class="toc-list"></nav>
+      <div class="toc-actions"><button id="theme-button">◐ 切换明暗</button></div>
+    </aside>
+    <footer class="reader-footer"><span id="page-label">— / — · 0%</span><span>左右翻页 · 中间显示工具栏</span></footer>
+  </section>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/vendor/jszip.min.js?v=3.10.1"></script>
+  <script src="/reader-cache.js?v=1" defer></script>
+  <script src="/reader.js?v=14" defer></script>
+  <script src="/app.js?v=14" defer></script>
+  <script src="/router.js?v=14" defer></script>
+</body>
+</html>
