@@ -57,3 +57,31 @@
 #reader-view.reader-shell{position:fixed;inset:0;z-index:30;overflow:hidden;background:#f7f3eb}
 #reader-view.dark{background:#191b1b}
 body.reader-open{overflow:hidden}
+
+/* Reader chrome（参考移动端阅读器，半透明纯色，不用毛玻璃以省性能） */
+.reader-bar{background:rgba(247,243,235,.92)}
+.reader-bar-title{text-align:center;min-width:0}
+.reader-bar-title strong{font:17px Georgia,"Noto Serif SC",serif;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.reader-bar-title small{font-size:10px;color:var(--muted);letter-spacing:.12em}
+.reader-icon-btn{display:grid;place-items:center;width:40px;height:40px;border:0;border-radius:50%;background:rgba(41,37,31,.06);color:var(--ink);font-size:20px;line-height:1;cursor:pointer;text-decoration:none;padding:0}
+.reader-icon-btn:active{background:rgba(41,37,31,.14)}
+.reader-footer{height:auto;flex-direction:column;gap:8px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:rgba(247,243,235,.96);color:var(--muted)}
+.reader-seek{display:flex;flex-direction:column;gap:6px;width:100%}
+.reader-seek #page-label{font-size:11px;text-align:center}
+#page-slider,#font-slider{-webkit-appearance:none;appearance:none;width:100%;height:4px;border-radius:99px;background:var(--line);outline:0;margin:0}
+#page-slider::-webkit-slider-thumb,#font-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:18px;height:18px;border-radius:50%;background:var(--accent);border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.25);cursor:pointer}
+#page-slider::-moz-range-thumb,#font-slider::-moz-range-thumb{width:18px;height:18px;border:2px solid #fff;border-radius:50%;background:var(--accent);cursor:pointer}
+.reader-actions{display:flex;justify-content:space-around;width:100%}
+.reader-action-btn{display:flex;flex-direction:column;align-items:center;gap:3px;border:0;background:transparent;color:var(--muted);cursor:pointer;padding:4px 14px;font-size:11px}
+.reader-action-btn b{font-size:18px;font-weight:400;line-height:1}
+.reader-action-btn:active{color:var(--accent)}
+.font-popover{position:fixed;left:50%;bottom:104px;transform:translateX(-50%);z-index:9;display:flex;align-items:center;gap:10px;padding:10px 14px;border:1px solid var(--line);border-radius:14px;background:var(--paper);box-shadow:0 12px 35px rgba(35,29,22,.2);color:var(--muted);font-size:12px}
+.font-popover #font-slider{width:150px}
+.font-step{border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);cursor:pointer;padding:5px 9px;font-size:13px}
+.tools-hidden .font-popover{display:none}
+.toc-scrim{backdrop-filter:none}
+.dark .reader-bar,.dark .reader-footer{background:#191b1b}
+.dark .reader-icon-btn{background:rgba(255,255,255,.08);color:#dedbd3}
+.dark .reader-action-btn{color:#92958f}
+.dark .font-popover{background:#232626}
+.dark .font-step{color:#dedbd3}

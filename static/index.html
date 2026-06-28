@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
   <title>页间 · 我的书架</title>
-  <link rel="stylesheet" href="/app.css?v=15">
+  <link rel="stylesheet" href="/app.css?v=16">
 </head>
 <body>
   <main id="auth" class="auth-shell hidden">
@@ -103,9 +103,9 @@
   <!-- 主视图：阅读器（embedded） -->
   <section id="reader-view" class="reader-shell hidden">
     <header class="reader-bar">
-      <button id="reader-back" class="reader-back" aria-label="返回书架">←</button>
-      <div><strong id="reader-title">正在打开…</strong><small id="reader-kind"></small></div>
-      <button class="reader-menu" id="toc-button" aria-label="打开目录" aria-expanded="false">☰</button>
+      <button id="reader-back" class="reader-icon-btn" aria-label="返回书架">←</button>
+      <div class="reader-bar-title"><strong id="reader-title">正在打开…</strong><small id="reader-kind"></small></div>
+      <button class="reader-icon-btn" id="toc-button" aria-label="打开目录" aria-expanded="false">☰</button>
     </header>
     <main id="viewport" class="reader-viewport">
       <div id="loading" class="reader-loading">正在打开书页…</div>
@@ -118,15 +118,30 @@
     <aside id="toc-drawer" class="toc-drawer" aria-label="书籍目录" aria-hidden="true">
       <div class="toc-heading"><div><small>CONTENTS</small><h2>目录</h2></div><button id="toc-close" aria-label="关闭目录">×</button></div>
       <nav id="toc-list" class="toc-list"></nav>
-      <div class="toc-actions"><button id="theme-button">◐ 切换明暗</button></div>
     </aside>
-    <footer class="reader-footer"><span id="page-label">— / — · 0%</span><span>左右翻页 · 中间显示工具栏</span></footer>
+    <div id="font-popover" class="font-popover hidden">
+      <span>字号</span>
+      <button id="font-smaller" class="font-step" aria-label="减小字号">A−</button>
+      <input id="font-slider" type="range" min="14" max="32" step="1" value="19" aria-label="阅读字号">
+      <button id="font-larger" class="font-step" aria-label="增大字号">A+</button>
+    </div>
+    <footer class="reader-footer">
+      <div class="reader-seek">
+        <span id="page-label">— / — · 0%</span>
+        <input id="page-slider" type="range" min="0" max="0" value="0" step="1" aria-label="页面进度">
+      </div>
+      <div class="reader-actions">
+        <button id="toc-button-2" class="reader-action-btn"><b>☰</b><span>目录</span></button>
+        <button id="font-button" class="reader-action-btn"><b>A</b><span>字号</span></button>
+        <button id="theme-button" class="reader-action-btn"><b>◐</b><span>明暗</span></button>
+      </div>
+    </footer>
   </section>
 
   <div id="toast" class="toast hidden"></div>
   <script src="/vendor/jszip.min.js?v=3.10.1"></script>
   <script src="/reader-cache.js?v=1" defer></script>
-  <script src="/reader.js?v=14" defer></script>
+  <script src="/reader.js?v=16" defer></script>
   <script src="/app.js?v=15" defer></script>
   <script src="/router.js?v=14" defer></script>
 </body>

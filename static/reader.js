@@ -46,10 +46,18 @@ window.ReaderApp = (function () {
       tocDrawer: scope.querySelector('#toc-drawer'),
       tocClose: scope.querySelector('#toc-close'),
       tocList: scope.querySelector('#toc-list'),
+      tocButton2: scope.querySelector('#toc-button-2'),
       themeButton: scope.querySelector('#theme-button'),
       pageLabel: scope.querySelector('#page-label'),
+      slider: scope.querySelector('#page-slider'),
+      fontButton: scope.querySelector('#font-button'),
+      fontPopover: scope.querySelector('#font-popover'),
+      fontSlider: scope.querySelector('#font-slider'),
+      fontSmaller: scope.querySelector('#font-smaller'),
+      fontLarger: scope.querySelector('#font-larger'),
     };
     bindEvents();
+    loadPrefs();
     initialized = true;
   }
 
@@ -58,10 +66,17 @@ window.ReaderApp = (function () {
     els.centerZone && (els.centerZone.onclick = toggleTools);
     els.nextZone && (els.nextZone.onclick = next);
     els.tocButton && (els.tocButton.onclick = () => openToc());
+    els.tocButton2 && (els.tocButton2.onclick = () => openToc());
     els.tocClose && (els.tocClose.onclick = () => closeToc());
     els.tocScrim && (els.tocScrim.onclick = () => closeToc());
     els.themeButton && (els.themeButton.onclick = toggleTheme);
     els.back && (els.back.onclick = event => { if (onExit) { event.preventDefault?.(); onExit(); } });
+    els.slider && (els.slider.oninput = event => seekTo(Number(event.target.value), false));
+    els.slider && (els.slider.onchange = () => active && queueProgressSave(active.currentPage));
+    els.fontButton && (els.fontButton.onclick = () => els.fontPopover?.classList.toggle('hidden'));
+    els.fontSlider && (els.fontSlider.oninput = event => setReaderFontSize(Number(event.target.value)));
+    els.fontSmaller && (els.fontSmaller.onclick = () => stepFontSize(-1));
+    els.fontLarger && (els.fontLarger.onclick = () => stepFontSize(1));
 
     window.addEventListener('resize', () => {
       clearTimeout(resizeTimer);
@@ -678,7 +693,10 @@ window.ReaderApp = (function () {
         }
         if (child.nodeType !== Node.ELEMENT_NODE) continue;
         if (BLOCK_TAGS.has(child.tagName)) {
-          blocks.push(child.cloneNode(true));
+          // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让每页行数忽多忽少）。
+          if (child.tagName === 'HR' || child.textContent.trim() || child.querySelector('img,svg,image')) {
+            blocks.push(child.cloneNode(true));
+          }
         } else if (hasBlockDescendant(child)) {
           walk(child);
         } else if (child.textContent.trim() || child.querySelector('img,svg')) {
@@ -700,6 +718,9 @@ window.ReaderApp = (function () {
       for (const attribute of Array.from(element.attributes)) {
         if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
       }
+      // 去掉书内自带的内联排版，统一交给阅读器样式，避免间距/字号忽大忽小。
+      element.removeAttribute('style');
+      element.removeAttribute('align');
     });
     doc.querySelectorAll('style,link[rel="stylesheet"]').forEach(node => node.remove());
   }
@@ -780,8 +801,41 @@ window.ReaderApp = (function () {
 
   function previous() { turnPage('prev'); }
   function next() { turnPage('next'); }
-  function toggleTools() { els.themeRoot.classList.toggle('tools-hidden'); }
-  function toggleTheme() { els.themeRoot.classList.toggle('dark'); }
+  function toggleTools() {
+    els.themeRoot.classList.toggle('tools-hidden');
+    if (els.themeRoot.classList.contains('tools-hidden')) els.fontPopover?.classList.add('hidden');
+  }
+  function toggleTheme() {
+    els.themeRoot.classList.toggle('dark');
+    try { localStorage.setItem('reader-theme', els.themeRoot.classList.contains('dark') ? 'dark' : 'light'); } catch (_) {}
+  }
+
+  function seekTo(page, save = true) {
+    if (!active) return;
+    active.currentPage = Math.min(Math.max(0, page), Math.max(0, active.pages.length - 1));
+    renderPage(active.currentPage);
+    updatePageLabel();
+    if (save) queueProgressSave(active.currentPage);
+  }
+
+  function stepFontSize(delta) {
+    const current = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--reader-font-size'), 10) || 19;
+    setReaderFontSize(current + delta);
+  }
+
+  function loadPrefs() {
+    try {
+      const size = Number(localStorage.getItem('reader-font-size'));
+      if (Number.isFinite(size) && size > 0) {
+        const pixels = Math.max(14, Math.min(32, size));
+        document.documentElement.style.setProperty('--reader-font-size', `${pixels}px`);
+        if (els.fontSlider) els.fontSlider.value = pixels;
+      }
+      const theme = localStorage.getItem('reader-theme');
+      if (theme === 'dark') els.themeRoot.classList.add('dark');
+      else if (theme === 'light') els.themeRoot.classList.remove('dark');
+    } catch (_) {}
+  }
 
   function renderToc() {
     const list = els.tocList;
@@ -834,6 +888,10 @@ window.ReaderApp = (function () {
     if (!active) return;
     const percentage = active.pages.length <= 1 ? 100 : Math.round((active.currentPage / (active.pages.length - 1)) * 100);
     els.pageLabel.textContent = `${active.currentPage + 1} / ${active.pages.length} · ${percentage}%`;
+    if (els.slider) {
+      els.slider.max = Math.max(0, active.pages.length - 1);
+      els.slider.value = active.currentPage;
+    }
   }
 
   function queueProgressSave(page) {
@@ -863,6 +921,8 @@ window.ReaderApp = (function () {
   function setReaderFontSize(size) {
     const pixels = Math.max(14, Math.min(32, Number(size) || 18));
     document.documentElement.style.setProperty('--reader-font-size', `${pixels}px`);
+    if (els.fontSlider) els.fontSlider.value = pixels;
+    try { localStorage.setItem('reader-font-size', pixels); } catch (_) {}
     requestRepagination();
   }
   window.setReaderFontSize = setReaderFontSize;
