@@ -539,7 +539,8 @@ window.ReaderApp = (function () {
         const childId = child.getAttribute('id');
         if (BLOCK_TAGS.has(child.tagName)) {
           // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让排版忽松忽紧）。
-          if (child.tagName === 'HR' || child.textContent.trim() || child.querySelector('img,svg,image')) {
+          if (child.tagName === 'HR' || child.tagName === 'IMG' || child.tagName === 'SVG'
+              || child.textContent.trim() || child.querySelector('img,svg,image')) {
             pushBlock(child.cloneNode(true));
           } else if (childId) {
             pendingIds.push(childId);
