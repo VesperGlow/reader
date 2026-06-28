@@ -1,11 +1,12 @@
-use std::{path::{Path, PathBuf}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use argon2::{Argon2, password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
@@ -25,11 +26,25 @@ const ROUTER_JS: &str = include_str!("../static/router.js");
 const JSZIP_JS: &str = include_str!("../static/vendor/jszip.min.js");
 const MAX_BOOK_SIZE: usize = 64 * 1024 * 1024;
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
+// 登录限速：单一来源在窗口内最多尝试次数，超出后返回 429（同时挡住对 Argon2 的 CPU 放大攻击）。
+const LOGIN_MAX_ATTEMPTS: u32 = 10;
+const LOGIN_WINDOW_SECONDS: i64 = 300;
+const SECURITY_HEADER_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<Mutex<Connection>>,
     books_dir: Arc<PathBuf>,
+    login_attempts: Arc<std::sync::Mutex<HashMap<String, LoginAttempt>>>,
+    // 用户名不存在时拿它跑一次等价的 Argon2 校验，抹平时序，避免用户名枚举。
+    dummy_hash: Arc<String>,
+    // 强制给会话 Cookie 加 Secure（READER_SECURE_COOKIE=1）；否则按 X-Forwarded-Proto 自动判断。
+    force_secure_cookie: bool,
+}
+
+struct LoginAttempt {
+    count: u32,
+    reset_at: i64,
 }
 
 #[derive(Debug)]
@@ -117,7 +132,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let connection = open_database(&data_dir)?;
 
-    let state = AppState { db: Arc::new(Mutex::new(connection)), books_dir: Arc::new(books_dir) };
+    let dummy_salt = SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(|error| format!("生成时序盐失败: {error}"))?;
+    let dummy_hash = Argon2::default().hash_password(b"timing-equalizer", &dummy_salt).map_err(|error| format!("生成时序哈希失败: {error}"))?.to_string();
+    let force_secure_cookie = matches!(
+        std::env::var("READER_SECURE_COOKIE").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+
+    let state = AppState {
+        db: Arc::new(Mutex::new(connection)),
+        books_dir: Arc::new(books_dir),
+        login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        dummy_hash: Arc::new(dummy_hash),
+        force_secure_cookie,
+    };
     let app = Router::new()
         .route("/", get(index))
         .route("/reader", get(reader_page))
@@ -137,13 +165,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/books/{id}/progress", get(get_progress).put(save_progress))
         .fallback(spa_fallback)
         .layer(DefaultBodyLimit::max(MAX_BOOK_SIZE + 1024 * 1024))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state);
 
     let address = std::env::var("READER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = TcpListener::bind(&address).await?;
     println!("Rust Reader: http://{address}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+// 给每个响应加安全响应头：CSP（脚本仅同源，挡注入脚本/事件处理器）、禁嗅探、禁内嵌。
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(SECURITY_HEADER_CSP));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn index() -> Html<&'static str> { Html(INDEX_HTML) }
@@ -163,18 +203,32 @@ async fn spa_fallback(uri: Uri) -> Response {
     Html(INDEX_HTML).into_response()
 }
 
-async fn login(State(state): State<AppState>, Json(input): Json<AuthInput>) -> AppResult<Response> {
+async fn login(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(input): Json<AuthInput>,
+) -> AppResult<Response> {
+    let ip = client_ip(&headers, Some(addr));
+    rate_limit_check(&state, &ip)?;
     let record = {
         let db = state.db.lock().await;
         db.query_row("SELECT id, password_hash FROM users WHERE username = ?1", [input.username.trim()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
             .optional().map_err(|_| AppError::internal("登录失败"))?
     };
-    let Some((user_id, stored_hash)) = record else { return Err(AppError::bad_request("用户名或密码错误")); };
+    let Some((user_id, stored_hash)) = record else {
+        // 用户不存在也跑一次等价的 Argon2 校验，让响应时间与"密码错误"一致，避免用户名枚举。
+        if let Ok(parsed) = PasswordHash::new(state.dummy_hash.as_str()) {
+            let _ = Argon2::default().verify_password(input.password.as_bytes(), &parsed);
+        }
+        return Err(AppError::bad_request("用户名或密码错误"));
+    };
     let parsed = PasswordHash::new(&stored_hash).map_err(|_| AppError::internal("账户密码数据无效"))?;
     if Argon2::default().verify_password(input.password.as_bytes(), &parsed).is_err() {
         return Err(AppError::bad_request("用户名或密码错误"));
     }
-    session_response(&state, user_id, "登录成功").await
+    rate_limit_reset(&state, &ip);
+    session_response(&state, user_id, "登录成功", cookie_secure(&state, &headers)).await
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
@@ -184,7 +238,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<
             .map_err(|_| AppError::internal("退出失败"))?;
     }
     let mut response = Json(ApiMessage { message: "已退出".into() }).into_response();
-    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("reader_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
+    let cookie = build_session_cookie("", 0, cookie_secure(&state, &headers));
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).map_err(|_| AppError::internal("退出失败"))?);
     Ok(response)
 }
 
@@ -519,17 +574,67 @@ fn normalize_optional_text(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-async fn session_response(state: &AppState, user_id: i64, message: &str) -> AppResult<Response> {
+async fn session_response(state: &AppState, user_id: i64, message: &str, secure: bool) -> AppResult<Response> {
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
     let db = state.db.lock().await;
     db.execute("DELETE FROM sessions WHERE expires_at < ?1", [now()]).map_err(|_| AppError::internal("会话清理失败"))?;
     db.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES(?1, ?2, ?3)", params![hash_token(&token), user_id, now() + SESSION_SECONDS])
         .map_err(|_| AppError::internal("创建会话失败"))?;
     drop(db);
-    let cookie = format!("reader_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_SECONDS}");
+    let cookie = build_session_cookie(&token, SESSION_SECONDS, secure);
     let mut response = Json(ApiMessage { message: message.into() }).into_response();
     response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_str(&cookie).map_err(|_| AppError::internal("创建会话失败"))?);
     Ok(response)
+}
+
+fn build_session_cookie(token: &str, max_age: i64, secure: bool) -> String {
+    let mut cookie = format!("reader_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+// 优先取反代透传的真实来源，其次回退到 TCP 连接地址。
+fn client_ip(headers: &HeaderMap, addr: Option<SocketAddr>) -> String {
+    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|value| value.to_str().ok()) {
+        let first = forwarded.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    if let Some(real) = headers.get("x-real-ip").and_then(|value| value.to_str().ok()) {
+        let real = real.trim();
+        if !real.is_empty() {
+            return real.to_string();
+        }
+    }
+    addr.map(|value| value.ip().to_string()).unwrap_or_else(|| "unknown".into())
+}
+
+fn cookie_secure(state: &AppState, headers: &HeaderMap) -> bool {
+    if state.force_secure_cookie {
+        return true;
+    }
+    headers.get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|proto| proto.split(',').next().unwrap_or("").trim().eq_ignore_ascii_case("https"))
+}
+
+fn rate_limit_check(state: &AppState, key: &str) -> AppResult<()> {
+    let now = now();
+    let mut attempts = state.login_attempts.lock().unwrap();
+    attempts.retain(|_, attempt| attempt.reset_at > now);
+    let entry = attempts.entry(key.to_string()).or_insert(LoginAttempt { count: 0, reset_at: now + LOGIN_WINDOW_SECONDS });
+    if entry.count >= LOGIN_MAX_ATTEMPTS {
+        return Err(AppError(StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试".into()));
+    }
+    entry.count += 1;
+    Ok(())
+}
+
+fn rate_limit_reset(state: &AppState, key: &str) {
+    state.login_attempts.lock().unwrap().remove(key);
 }
 
 async fn authenticated_user(state: &AppState, headers: &HeaderMap) -> AppResult<(i64, String)> {

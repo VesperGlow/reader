@@ -28,7 +28,7 @@
       <a class="logo" href="/"><span>页</span> 页间</a>
       <div class="top-actions">
         <span class="muted" id="welcome"></span>
-        <label class="upload-button">＋ 添加书籍<input id="file-input" type="file" accept=".epub,.txt" hidden></label>
+        <label class="upload-button">＋ 添加书籍<input id="file-input" type="file" accept=".epub,.txt" multiple hidden></label>
         <button class="ghost" id="logout">退出</button>
       </div>
     </header>
@@ -64,7 +64,7 @@
       <div class="drawer-content">
         <label class="drawer-search"><span>搜索书籍</span><input id="book-search" type="search" placeholder="输入书名、作者或系列" autocomplete="off"></label>
         <div class="drawer-actions">
-          <label class="drawer-action">＋<span><strong>添加 / 导入书籍</strong><small>支持 EPUB、TXT</small></span><input id="drawer-file-input" type="file" accept=".epub,.txt" hidden></label>
+          <label class="drawer-action">＋<span><strong>添加 / 导入书籍</strong><small>支持 EPUB、TXT，可多选</small></span><input id="drawer-file-input" type="file" accept=".epub,.txt" multiple hidden></label>
           <button class="drawer-action" id="manage-books">✓<span><strong>删除书籍 / 批量管理</strong><small>选择多本书后删除</small></span></button>
           <button class="drawer-action" id="edit-shelf">✎<span><strong>编辑书架</strong><small>修改书名、作者与系列</small></span></button>
           <button class="drawer-action" id="settings-button">⚙<span><strong>设置</strong><small>显示与账户设置</small></span></button>
@@ -141,8 +141,8 @@
   <div id="toast" class="toast hidden"></div>
   <script src="/vendor/jszip.min.js?v=3.10.1"></script>
   <script src="/reader-cache.js?v=1" defer></script>
-  <script src="/reader.js?v=21" defer></script>
-  <script src="/app.js?v=15" defer></script>
+  <script src="/reader.js?v=22" defer></script>
+  <script src="/app.js?v=16" defer></script>
   <script src="/router.js?v=14" defer></script>
 </body>
 </html>

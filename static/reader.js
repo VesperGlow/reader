@@ -546,10 +546,18 @@ window.ReaderApp = (function () {
   }
 
   function sanitizeDocument(doc) {
-    doc.querySelectorAll('script,iframe,object,embed,form,input,button').forEach(node => node.remove());
+    doc.querySelectorAll('script,iframe,object,embed,form,input,button,meta,base').forEach(node => node.remove());
     doc.querySelectorAll('*').forEach(element => {
       for (const attribute of Array.from(element.attributes)) {
         if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
+      }
+      // 链接里的危险协议清掉：javascript:/vbscript: 一律去；data: 仅 SVG <image> 放行（图片走 src）。
+      const tag = element.localName;
+      for (const attribute of ['href', 'xlink:href']) {
+        const value = element.getAttribute(attribute);
+        if (!value) continue;
+        if (/^\s*(?:javascript|vbscript):/i.test(value)) { element.removeAttribute(attribute); continue; }
+        if (/^\s*data:/i.test(value) && tag !== 'image') element.removeAttribute(attribute);
       }
       // 去掉书内自带的内联排版，统一交给阅读器样式，避免间距/字号忽大忽小。
       element.removeAttribute('style');

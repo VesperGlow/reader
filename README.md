@@ -48,6 +48,10 @@ cargo run --release
 READER_ADDR=0.0.0.0:8080 READER_DATA_DIR=/path/to/data cargo run --release
 ```
 
+- `READER_ADDR`：监听地址，默认 `127.0.0.1:3000`。
+- `READER_DATA_DIR`：数据目录（数据库与书籍），默认 `./data`。
+- `READER_SECURE_COOKIE`：设为 `1`/`true` 时强制给会话 Cookie 加 `Secure`。默认会按反代透传的 `X-Forwarded-Proto: https` 自动判断；若反代没有透传该头，HTTPS 部署下请显式设为 `1`。
+
 ## 容器部署
 
 每次推送到 `main` 会由 GitHub Actions 编译并发布镜像到 GHCR：
@@ -66,8 +70,10 @@ docker compose up -d --build
 
 ## 部署说明
 
-- 默认监听本机地址；公网部署请放在 Caddy/Nginx 等 HTTPS 反向代理之后。
+- 默认监听本机地址；公网部署请放在 Caddy/Nginx 等 HTTPS 反向代理之后，并确保透传 `X-Forwarded-For` 与 `X-Forwarded-Proto`（登录限流按真实来源计数、`Secure` Cookie 据此自动开启）。
+- 内置登录限流：单一来源 5 分钟内最多 10 次尝试，超出返回 429（同时缓解针对 Argon2 的 CPU 放大攻击）。
+- 全站发送 CSP 等安全响应头（脚本仅允许同源），EPUB 正文在前端清洗时移除脚本/事件处理器并剥离 `javascript:` 等危险协议链接，降低恶意 EPUB 的 XSS 风险。
 - EPUB 解包组件随应用本地提供，不依赖外部 CDN。
-- 上传上限为 64 MB。
+- 上传上限为单本 64 MB，支持一次多选批量上传。
 - 阅读器分页基于浏览器视口高度，不同浏览器/是否显示地址栏会使总页数略有差异，属正常现象；进度按百分比保存，跨设备打开仍会回到大致相同的位置。
-- 这是私人阅读器 MVP。若开放给不受信任的公众用户，建议再加入登录限流、CSRF Token、存储配额和后台管理。
+- 这是私人阅读器 MVP。若开放给不受信任的公众用户，建议再加入 CSRF Token、存储配额和后台管理。

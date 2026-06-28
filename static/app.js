@@ -415,23 +415,42 @@ window.Shelf = (function () {
 
   async function handleUpload(event) {
     const input = event.target;
-    const file = input.files[0];
-    if (!file) return;
-    $('#uploading').classList.remove('hidden');
-    try {
-      const metadataPromise = extractEpubMetadata(file);
-      const form = new FormData();
-      form.append('book', file);
-      const book = await api('/api/books', { method: 'POST', body: form });
-      const metadata = await metadataPromise;
-      if (metadata && (metadata.author || metadata.series_name)) {
-        await api(`/api/books/${book.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(metadata) });
+    const files = Array.from(input.files || []);
+    if (!files.length) return;
+    const total = files.length;
+    const uploading = $('#uploading');
+    uploading.classList.remove('hidden');
+    let done = 0;
+    const failures = [];
+    for (const file of files) {
+      uploading.textContent = total > 1 ? `正在上传 ${done + failures.length + 1} / ${total}…` : '正在把书放上书架…';
+      try {
+        await uploadOne(file);
+        done++;
+      } catch (error) {
+        failures.push(file.name || '未命名');
+        console.error('上传失败', file.name, error);
       }
-      await loadBooks();
-      toast('已放入书架');
-      closeDrawer();
-    } catch (error) { toast(error.message); }
-    finally { $('#uploading').classList.add('hidden'); input.value = ''; }
+    }
+    uploading.classList.add('hidden');
+    uploading.textContent = '正在把书放上书架…';
+    input.value = '';
+    await loadBooks();
+    if (!failures.length) toast(total > 1 ? `已添加 ${done} 本` : '已放入书架');
+    else if (done) toast(`成功 ${done} 本，失败 ${failures.length} 本`);
+    else toast(`上传失败：${failures[0]}`);
+    closeDrawer();
+  }
+
+  async function uploadOne(file) {
+    const metadataPromise = extractEpubMetadata(file);
+    const form = new FormData();
+    form.append('book', file);
+    const book = await api('/api/books', { method: 'POST', body: form });
+    const metadata = await metadataPromise;
+    if (metadata && (metadata.author || metadata.series_name)) {
+      await api(`/api/books/${book.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(metadata) });
+    }
   }
 
   function coverColor(index, id) { const colors = ['#704b3b', '#465c54', '#314b64', '#80643b', '#643f4d', '#4f526d']; return colors[(index + id) % colors.length]; }
