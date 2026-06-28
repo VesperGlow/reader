@@ -514,26 +514,43 @@ window.ReaderApp = (function () {
 
   function collectReadableBlocks(rootNode) {
     const blocks = [];
+    // 收集时会丢掉包裹用的 <div id>/空 <a id> 锚点，但目录的 #fragment 往往就指向它们。
+    // 把这些待定的锚点 id 顺延到紧随其后的第一个可读块上，保证目录能定位到正文。
+    let pendingIds = [];
+    const pushBlock = block => {
+      if (pendingIds.length) {
+        const existing = block.dataset.fragIds ? block.dataset.fragIds + ' ' : '';
+        block.dataset.fragIds = existing + pendingIds.join(' ');
+        pendingIds = [];
+      }
+      blocks.push(block);
+    };
     const walk = parent => {
       for (const child of parent.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
           if (child.textContent.trim()) {
             const paragraph = document.createElement('p');
             paragraph.textContent = child.textContent;
-            blocks.push(paragraph);
+            pushBlock(paragraph);
           }
           continue;
         }
         if (child.nodeType !== Node.ELEMENT_NODE) continue;
+        const childId = child.getAttribute('id');
         if (BLOCK_TAGS.has(child.tagName)) {
           // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让排版忽松忽紧）。
           if (child.tagName === 'HR' || child.textContent.trim() || child.querySelector('img,svg,image')) {
-            blocks.push(child.cloneNode(true));
+            pushBlock(child.cloneNode(true));
+          } else if (childId) {
+            pendingIds.push(childId);
           }
         } else if (hasBlockDescendant(child)) {
+          if (childId) pendingIds.push(childId);
           walk(child);
         } else if (child.textContent.trim() || child.querySelector('img,svg')) {
-          blocks.push(child.cloneNode(true));
+          pushBlock(child.cloneNode(true));
+        } else if (childId) {
+          pendingIds.push(childId);
         }
       }
     };
@@ -678,7 +695,8 @@ window.ReaderApp = (function () {
     const node = state.contentNode;
     if (state.kind === 'txt') return node.querySelector(`[data-toc="${index}"]`);
     if (entry.fragment) {
-      const byId = Array.from(node.querySelectorAll('[id]')).find(element => element.id === entry.fragment);
+      const byId = Array.from(node.querySelectorAll('[id], [data-frag-ids]')).find(element =>
+        element.id === entry.fragment || (element.dataset.fragIds || '').split(' ').includes(entry.fragment));
       if (byId) return byId;
     }
     return Array.from(node.querySelectorAll('[data-source-path]')).find(element => element.dataset.sourcePath === entry.path) || null;
