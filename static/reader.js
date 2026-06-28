@@ -78,10 +78,16 @@ window.ReaderApp = (function () {
     els.fontSmaller && (els.fontSmaller.onclick = () => stepFontSize(-1));
     els.fontLarger && (els.fontLarger.onclick = () => stepFontSize(1));
 
-    window.addEventListener('resize', () => {
+    // 地址栏滑入/滑出（dvh 变化）有时只动 visualViewport 而不触发 window.resize，两个都听。
+    // 仅在视口尺寸真正变化时才重排，避免 visualViewport 的杂音事件造成无谓重排；
+    // 改字号引起的重排走 setReaderFontSize 直接调用，不经过这里。
+    const scheduleRelayout = () => {
+      if (active && els.viewport.clientWidth === active.pageWidth && els.viewport.clientHeight === active.pageHeight) return;
       clearTimeout(resizeTimer);
       resizeTimer = setTimeout(relayoutActive, 200);
-    });
+    };
+    window.addEventListener('resize', scheduleRelayout);
+    window.visualViewport?.addEventListener('resize', scheduleRelayout);
     document.addEventListener('keydown', event => {
       if (!isVisible()) return;
       if (['ArrowLeft', 'PageUp'].includes(event.key)) previous();
@@ -691,12 +697,68 @@ window.ReaderApp = (function () {
 
   function relayoutActive() {
     if (!active || !isVisible()) return;
-    const ratio = active.pageCount > 1 ? active.currentPage / (active.pageCount - 1) : 0;
+    // 重排前抓住当前页左上角的文字位置；重排后把它对回页顶，正文不漂移、不跳行。
+    // 抓不到锚点（极少数情况）才退回旧的按比例映射。
+    const anchor = captureTopAnchor(active);
+    const fallbackRatio = active.pageCount > 1 ? active.currentPage / (active.pageCount - 1) : 0;
     measure(active);
-    goToPage(active, Math.round(ratio * Math.max(0, active.pageCount - 1)));
+    let page = anchor ? anchorPage(active, anchor) : null;
+    if (page == null) page = Math.round(fallbackRatio * Math.max(0, active.pageCount - 1));
+    goToPage(active, page);
     renderToc();
     updatePageLabel();
     queueProgressSave(active.currentPage);
+  }
+
+  // 用 DOM 文本锚点记录"当前页顶端是哪段文字"。EPUB（块元素）与 TXT（裸文本节点）通用。
+  function captureTopAnchor(state) {
+    const node = state.contentNode;
+    const style = getComputedStyle(node);
+    const padLeft = parseFloat(style.paddingLeft) || 0;
+    const padTop = parseFloat(style.paddingTop) || 0;
+    const rect = els.viewport.getBoundingClientRect();
+    return caretAt(rect.left + padLeft + 8, rect.top + padTop + 8);
+  }
+
+  function caretAt(x, y) {
+    // 透明翻页热区盖在正文之上，会先被命中测试取到。临时让它们对命中透明，才能定位到文字。
+    const zones = [els.prevZone, els.centerZone, els.nextZone].filter(Boolean);
+    const saved = zones.map(zone => zone.style.pointerEvents);
+    zones.forEach(zone => { zone.style.pointerEvents = 'none'; });
+    try {
+      if (document.caretPositionFromPoint) {
+        const pos = document.caretPositionFromPoint(x, y);
+        return pos ? { node: pos.offsetNode, offset: pos.offset } : null;
+      }
+      if (document.caretRangeFromPoint) {
+        const range = document.caretRangeFromPoint(x, y);
+        return range ? { node: range.startContainer, offset: range.startOffset } : null;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    } finally {
+      zones.forEach((zone, index) => { zone.style.pointerEvents = saved[index]; });
+    }
+  }
+
+  function anchorPage(state, anchor) {
+    if (!anchor || !anchor.node || !anchor.node.isConnected) return null;
+    if (!state.contentNode.contains(anchor.node)) return null;
+    try {
+      const range = document.createRange();
+      const max = anchor.node.nodeType === Node.TEXT_NODE ? anchor.node.length : anchor.node.childNodes.length;
+      range.setStart(anchor.node, Math.min(anchor.offset, max));
+      range.collapse(true);
+      const rects = range.getClientRects();
+      const rect = rects.length ? rects[0] : range.getBoundingClientRect();
+      if (!rect) return null;
+      const baseLeft = state.contentNode.getBoundingClientRect().left;
+      const page = Math.round((rect.left - baseLeft) / state.pageStep);
+      return Math.max(0, Math.min(state.pageCount - 1, page));
+    } catch (_) {
+      return null;
+    }
   }
 
   function toggleTools() {
