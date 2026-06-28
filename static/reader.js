@@ -626,23 +626,26 @@ window.ReaderApp = (function () {
     const height = els.viewport.clientHeight;
     let sidePad = Math.round(Math.min(Math.max(width * 0.055, 16), 44));
     if (width - 2 * sidePad > MAX_COLUMN) sidePad = Math.round((width - MAX_COLUMN) / 2);
+    // 关键：把容器宽度钉成整数、box-sizing 内联强制，保证栏距严格 = 整数屏宽，
+    // 否则浏览器用小数宽拉伸单栏，会让 translateX 逐页漂移、文字接不上。
+    node.style.boxSizing = 'border-box';
+    node.style.width = `${width}px`;
     node.style.height = `${height}px`;
     node.style.padding = `28px ${sidePad}px 24px`;
     node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
     node.style.columnGap = `${2 * sidePad}px`;
+    node.style.columnFill = 'auto';
     node.style.transform = 'translateX(0px)';
     state.pageWidth = width;
     state.pageHeight = height;
-    const total = node.scrollWidth;
-    state.pageCount = Math.max(1, Math.round(total / width));
-    // 用“实际总宽 / 总页数”当每页步长，抵消分栏的亚像素误差（否则翻多页会逐渐错位）。
-    state.pageStep = total / state.pageCount;
+    state.pageStep = width;
+    state.pageCount = Math.max(1, Math.round(node.scrollWidth / width));
     mapTocPages(state);
   }
 
   function goToPage(state, index) {
     state.currentPage = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
-    state.contentNode.style.transform = `translateX(${-Math.round(state.currentPage * state.pageStep)}px)`;
+    state.contentNode.style.transform = `translateX(${-state.currentPage * state.pageStep}px)`;
     updateTocActive();
   }
 
