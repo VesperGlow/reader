@@ -80,7 +80,7 @@ body.reader-open{overflow:hidden}
 .font-step{border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);cursor:pointer;padding:5px 9px;font-size:13px}
 .tools-hidden .font-popover{display:none}
 /* 分栏正文：整本书放进一个多栏容器，每栏=一屏，靠 transform 切页 */
-.book-content{box-sizing:border-box;column-fill:auto;font-family:Georgia,"Noto Serif SC",serif;font-size:var(--reader-font-size,clamp(17px,2vw,20px));line-height:1.7;color:#29251f;overflow-wrap:anywhere;will-change:transform}
+.book-content{box-sizing:border-box;column-fill:auto;orphans:1;widows:1;font-family:Georgia,"Noto Serif SC",serif;font-size:var(--reader-font-size,clamp(17px,2vw,20px));line-height:1.7;color:#29251f;overflow-wrap:anywhere;will-change:transform}
 .book-content.txt{white-space:pre-wrap}
 .book-content .toc-anchor{display:inline}
 .book-content h1,.book-content h2,.book-content h3,.book-content h4{font-family:Georgia,"Noto Serif SC",serif;line-height:1.35;margin:.4em 0 .7em;break-inside:avoid}
