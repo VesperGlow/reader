@@ -633,13 +633,16 @@ window.ReaderApp = (function () {
     node.style.transform = 'translateX(0px)';
     state.pageWidth = width;
     state.pageHeight = height;
-    state.pageCount = Math.max(1, Math.round(node.scrollWidth / width));
+    const total = node.scrollWidth;
+    state.pageCount = Math.max(1, Math.round(total / width));
+    // 用“实际总宽 / 总页数”当每页步长，抵消分栏的亚像素误差（否则翻多页会逐渐错位）。
+    state.pageStep = total / state.pageCount;
     mapTocPages(state);
   }
 
   function goToPage(state, index) {
     state.currentPage = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
-    state.contentNode.style.transform = `translateX(${-state.currentPage * state.pageWidth}px)`;
+    state.contentNode.style.transform = `translateX(${-Math.round(state.currentPage * state.pageStep)}px)`;
     updateTocActive();
   }
 
@@ -649,7 +652,7 @@ window.ReaderApp = (function () {
     state.tocEntries = (state.toc || []).map((entry, index) => {
       const target = findTocTarget(state, entry, index);
       let page = 0;
-      if (target) page = Math.max(0, Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageWidth));
+      if (target) page = Math.max(0, Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageStep));
       return { ...entry, page: Math.min(page, state.pageCount - 1) };
     });
   }
