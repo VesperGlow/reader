@@ -1,29 +1,29 @@
-// ReaderApp: 自包含的阅读器模块。
+// ReaderApp: 自包含的阅读器模块（CSS 分栏分页版）。
 // - SPA 模式：由 router 调用 ReaderApp.init(#reader-view) 与 openBook(id, {embedded:true})。
 // - 兼容模式：单独打开 reader.html?id=1 时自动 init(document.body) 并 openBook(id)。
-// 同一会话内最多保留 2 本书的运行时缓存（keep-alive），再次打开同书不重新加载/解析。
+// 渲染：把整本书的内容放进一个多栏容器（每栏=一屏），靠 translateX 切页，浏览器负责按行填满与重排。
+// 同一会话内最多保留 2 本书的运行时缓存（keep-alive）。
 window.ReaderApp = (function () {
   'use strict';
 
   const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'PRE', 'FIGURE', 'IMG', 'SVG', 'TABLE', 'HR']);
   const READER_CACHE_VERSION = window.readerCache?.CACHE_VERSION || 1;
   const RUNTIME_LIMIT = 2;
+  const MAX_COLUMN = 720; // 桌面宽屏时限制单栏文字宽度，保证可读性
 
-  // bookId(string) -> state，order 维护 LRU（末尾为最近使用）。
-  const runtime = new Map();
-  const order = [];
+  const runtime = new Map(); // bookId(string) -> state
+  const order = [];          // LRU：末尾为最近使用
 
   let root = null;
   let els = {};
   let initialized = false;
   let active = null; // 当前展示的书 state
   let onExit = null;
-  let repaginating = false;
-  let repaginationPending = false;
   let progressSaveChain = Promise.resolve();
   let resizeTimer = null;
 
-  // state: { bookId, info, kind, sourceModel, pages, currentPage, tocEntries, viewportW, viewportH }
+  // state: { bookId, info, kind, contentNode, toc, tocEntries, assetUrls,
+  //          currentPage, pageCount, pageWidth, pageHeight, restoreRatio }
 
   function init(rootElement) {
     if (initialized) return;
@@ -80,13 +80,12 @@ window.ReaderApp = (function () {
 
     window.addEventListener('resize', () => {
       clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(requestRepagination, 250);
+      resizeTimer = setTimeout(relayoutActive, 200);
     });
     document.addEventListener('keydown', event => {
       if (!isVisible()) return;
       if (['ArrowLeft', 'PageUp'].includes(event.key)) previous();
       if (['ArrowRight', 'PageDown', ' '].includes(event.key)) next();
-      // SPA 模式下由 Router 统一处理 ESC，避免重复触发 history.back。
       if (event.key === 'Escape' && isTocOpen() && !window.Router) closeToc();
     });
     const flush = () => saveProgress();
@@ -133,7 +132,6 @@ window.ReaderApp = (function () {
     while (order.length > RUNTIME_LIMIT) {
       const oldest = order[0];
       if (oldest === active?.bookId) {
-        // 不淘汰当前书，把它挪到末尾后再看
         order.push(order.shift());
         if (order[0] === active?.bookId) break;
         continue;
@@ -154,8 +152,7 @@ window.ReaderApp = (function () {
   }
 
   function releaseAssets(state) {
-    const urls = state?.sourceModel?.assetUrls;
-    if (urls) for (const url of urls.values()) URL.revokeObjectURL(url);
+    if (state?.assetUrls) for (const url of state.assetUrls.values()) URL.revokeObjectURL(url);
   }
 
   // ---- 打开书籍 ----
@@ -165,16 +162,12 @@ window.ReaderApp = (function () {
     if (options.onExit) onExit = options.onExit;
     show();
 
-    // 复用：当前正展示的书，或运行时缓存里的书。
     const reused = (active && active.bookId === bookId) ? active : runtime.get(bookId);
     if (reused) {
       console.info('[reader runtime] hit', { bookId });
       if (active && active !== reused) saveProgress();
       active = reused;
       touchLRU(bookId);
-      if (reused.viewportW !== els.viewport.clientWidth || reused.viewportH !== els.viewport.clientHeight) {
-        await paginateState(reused, true);
-      }
       applyActiveToDom();
       return;
     }
@@ -190,7 +183,7 @@ window.ReaderApp = (function () {
       touchLRU(bookId);
       active = state;
       evictLRU();
-      renderPage(state.currentPage);
+      activate(state);
       renderToc();
       els.loading.classList.add('hidden');
       updatePageLabel();
@@ -203,7 +196,12 @@ window.ReaderApp = (function () {
   function applyActiveToDom() {
     if (!active) return;
     setHeader(active.info);
-    renderPage(active.currentPage);
+    const mounted = els.page.firstElementChild === active.contentNode;
+    if (!mounted || active.pageWidth !== els.viewport.clientWidth || active.pageHeight !== els.viewport.clientHeight) {
+      activate(active);
+    } else {
+      goToPage(active, active.currentPage);
+    }
     renderToc();
     els.loading.classList.add('hidden');
     updatePageLabel();
@@ -222,16 +220,47 @@ window.ReaderApp = (function () {
     console.time('restore progress');
     const savedProgress = api(`/api/books/${bookId}/progress`)
       .then(response => response.json())
+      .catch(() => ({ page: 0, total_pages: null }))
       .finally(() => console.timeEnd('restore progress'));
 
     setLoading('正在读取书籍…');
-    const sourceModel = await loadBookSource(bookId, info);
-    const state = { bookId, info, kind: info.kind, sourceModel, pages: [], currentPage: 0, tocEntries: [], viewportW: 0, viewportH: 0 };
-    active = state;
-    await paginateState(state, false);
+    const model = await loadBookSource(bookId, info);
+    const contentNode = assembleContent(model);
+    const state = {
+      bookId, info, kind: info.kind, contentNode,
+      toc: model.toc || [], tocEntries: [], assetUrls: model.assetUrls || null,
+      currentPage: 0, pageCount: 1, pageWidth: 0, pageHeight: 0, restoreRatio: 0,
+    };
     const progress = await savedProgress;
-    state.currentPage = Math.min(Math.max(0, Number(progress.page) || 0), Math.max(0, state.pages.length - 1));
+    state.restoreRatio = progress && progress.total_pages > 1
+      ? Math.min(1, Math.max(0, Number(progress.page) / (Number(progress.total_pages) - 1)))
+      : 0;
     return state;
+  }
+
+  function assembleContent(model) {
+    if (model.kind === 'txt') {
+      const node = document.createElement('div');
+      node.className = 'book-content txt';
+      const toc = (model.toc || []).map((entry, index) => ({ offset: Number(entry.offset) || 0, index }))
+        .sort((a, b) => a.offset - b.offset);
+      let pos = 0;
+      for (const { offset, index } of toc) {
+        const at = Math.max(pos, Math.min(model.text.length, offset));
+        if (at > pos) node.appendChild(document.createTextNode(model.text.slice(pos, at)));
+        const anchor = document.createElement('span');
+        anchor.className = 'toc-anchor';
+        anchor.dataset.toc = String(index);
+        node.appendChild(anchor);
+        pos = at;
+      }
+      node.appendChild(document.createTextNode(model.text.slice(pos)));
+      return node;
+    }
+    const node = document.createElement('div');
+    node.className = 'book-content epub';
+    for (const block of model.blocks) node.appendChild(block);
+    return node;
   }
 
   async function fetchBookInfo(bookId) {
@@ -331,188 +360,6 @@ window.ReaderApp = (function () {
     if (!metadata || metadata.cacheVersion !== READER_CACHE_VERSION || metadata.updatedAt !== Number(updatedAt) || !Array.isArray(metadata.toc)) return false;
     if (kind === 'txt') return true;
     return typeof metadata.opfPath === 'string' && Array.isArray(metadata.manifest) && Array.isArray(metadata.spine);
-  }
-
-  // ---- 分页 ----
-  async function paginateState(state, preservePosition = true) {
-    if (!state.sourceModel || repaginating) return;
-    repaginating = true;
-    console.time('paginate');
-    const oldRatio = state.pages.length > 1 ? state.currentPage / (state.pages.length - 1) : 0;
-    if (state === active) setLoading('正在分页…');
-    await nextFrame();
-    try {
-      state.pages = state.sourceModel.kind === 'txt'
-        ? paginateText(state.sourceModel.text)
-        : paginateHtmlBlocks(state.sourceModel.blocks);
-      if (!state.pages.length) state.pages = [makeTextPage('')];
-      validatePageContinuity(state);
-      state.tocEntries = mapTocToPages(state, state.sourceModel.toc || []);
-      state.viewportW = els.viewport.clientWidth;
-      state.viewportH = els.viewport.clientHeight;
-      if (preservePosition) state.currentPage = Math.min(state.pages.length - 1, Math.round(oldRatio * Math.max(0, state.pages.length - 1)));
-      if (state !== active) return;
-      if (!els.loading.classList.contains('hidden')) return; // 初次加载，渲染交给调用方
-      renderPage(state.currentPage);
-      updatePageLabel();
-      if (preservePosition) queueProgressSave(state.currentPage);
-    } finally {
-      console.timeEnd('paginate');
-      repaginating = false;
-      if (repaginationPending) {
-        repaginationPending = false;
-        setTimeout(() => active && paginateState(active, true), 0);
-      }
-    }
-  }
-
-  function createProbe(extraClass = '') {
-    const viewport = els.viewport;
-    const probe = document.createElement('div');
-    probe.className = 'pagination-probe';
-    probe.style.width = `${viewport.clientWidth}px`;
-    probe.style.height = `${viewport.clientHeight}px`;
-    const content = document.createElement('div');
-    content.className = `page-content ${extraClass}`;
-    probe.appendChild(content);
-    document.body.appendChild(probe);
-    return { probe, content };
-  }
-
-  function paginateText(text) {
-    const result = [];
-    const { probe, content } = createProbe('txt');
-    let offset = 0;
-    while (offset < text.length) {
-      const remaining = text.length - offset;
-      let high = Math.min(remaining, 4096);
-      while (high < remaining && textFits(content, text.slice(offset, offset + high))) high = Math.min(remaining, high * 2);
-      let low = 1;
-      while (low < high) {
-        const middle = Math.ceil((low + high) / 2);
-        if (textFits(content, text.slice(offset, offset + middle))) low = middle;
-        else high = middle - 1;
-      }
-      let length = Math.max(1, low);
-      if (length < remaining) length = naturalBreak(text, offset, length);
-      result.push(makeTextPage(text.slice(offset, offset + length), offset));
-      offset += length;
-    }
-    probe.remove();
-    return result;
-  }
-
-  function textFits(content, text) {
-    content.textContent = text;
-    return content.scrollHeight <= content.clientHeight + 1;
-  }
-
-  function naturalBreak(text, offset, length) {
-    const sample = text.slice(offset, offset + length);
-    const minimum = Math.floor(length * 0.72);
-    const newline = sample.lastIndexOf('\n');
-    if (newline >= minimum) return newline + 1;
-    const whitespace = Math.max(sample.lastIndexOf(' '), sample.lastIndexOf('\t'));
-    return whitespace >= minimum ? whitespace + 1 : length;
-  }
-
-  function paginateHtmlBlocks(blocks) {
-    const result = [];
-    const { probe, content } = createProbe('epub');
-    let pageBlocks = [];
-
-    const flush = () => {
-      if (!pageBlocks.length) return;
-      result.push(makeHtmlPage(pageBlocks));
-      pageBlocks = [];
-      content.replaceChildren();
-    };
-
-    for (const original of blocks) {
-      const candidate = original.cloneNode(true);
-      content.appendChild(candidate);
-      if (content.scrollHeight <= content.clientHeight + 1) {
-        pageBlocks.push(original);
-        continue;
-      }
-      candidate.remove();
-      flush();
-
-      const retry = original.cloneNode(true);
-      content.appendChild(retry);
-      if (content.scrollHeight <= content.clientHeight + 1) {
-        pageBlocks.push(original);
-        continue;
-      }
-      content.replaceChildren();
-
-      if (original.textContent.trim() && !['IMG', 'SVG'].includes(original.tagName)) {
-        const pieces = splitOversizedBlock(original, content);
-        for (const piece of pieces) result.push(makeHtmlPage([piece]));
-      } else {
-        pageBlocks.push(original);
-        content.appendChild(original.cloneNode(true));
-        flush();
-      }
-    }
-    flush();
-    probe.remove();
-    return result;
-  }
-
-  function splitOversizedBlock(block, content) {
-    const text = block.textContent;
-    const pieces = [];
-    const makePiece = () => ['TABLE', 'FIGURE'].includes(block.tagName) ? document.createElement('div') : block.cloneNode(false);
-    let offset = 0;
-    while (offset < text.length) {
-      let low = 1;
-      let high = text.length - offset;
-      while (low < high) {
-        const middle = Math.ceil((low + high) / 2);
-        const test = makePiece();
-        test.textContent = text.slice(offset, offset + middle);
-        content.replaceChildren(test);
-        if (content.scrollHeight <= content.clientHeight + 1) low = middle;
-        else high = middle - 1;
-      }
-      let length = Math.max(1, low);
-      if (length < text.length - offset) length = naturalBreak(text, offset, length);
-      const piece = makePiece();
-      piece.removeAttribute('id');
-      piece.textContent = text.slice(offset, offset + length);
-      pieces.push(piece);
-      offset += length;
-    }
-    content.replaceChildren();
-    return pieces;
-  }
-
-  function makeTextPage(text, start = 0) {
-    const fragment = document.createDocumentFragment();
-    const content = document.createElement('div');
-    content.className = 'page-content txt';
-    content.dataset.textStart = start;
-    content.appendChild(document.createTextNode(text));
-    fragment.appendChild(content);
-    return fragment;
-  }
-
-  function makeHtmlPage(blocks) {
-    const fragment = document.createDocumentFragment();
-    const content = document.createElement('div');
-    content.className = 'page-content epub';
-    for (const block of blocks) content.appendChild(block.cloneNode(true));
-    fragment.appendChild(content);
-    return fragment;
-  }
-
-  function validatePageContinuity(state) {
-    const renderedText = state.pages.map(page => page.textContent).join('');
-    const sourceText = state.sourceModel.kind === 'txt'
-      ? state.sourceModel.text
-      : state.sourceModel.blocks.map(block => block.textContent).join('');
-    if (renderedText !== sourceText) throw new Error('分页连续性校验失败：检测到文字丢失或重复');
   }
 
   async function parseEpub(bookId, buffer, cachedMetadata = null, updatedAt = 0) {
@@ -659,26 +506,6 @@ window.ReaderApp = (function () {
     return entries.slice(0, 500);
   }
 
-  function mapTocToPages(state, entries) {
-    if (state.sourceModel.kind === 'txt') {
-      const starts = state.pages.map(page => Number(page.querySelector('.page-content')?.dataset.textStart || 0));
-      return entries.map(entry => {
-        let page = 0;
-        for (let index = 0; index < starts.length && starts[index] <= entry.offset; index++) page = index;
-        return { ...entry, page };
-      });
-    }
-    return entries.map(entry => {
-      let page = state.pages.findIndex(fragment => {
-        const content = fragment.querySelector('.page-content');
-        if (!content) return false;
-        if (entry.fragment && Array.from(content.querySelectorAll('[id]')).some(element => element.id === entry.fragment)) return true;
-        return Array.from(content.querySelectorAll('[data-source-path]')).some(element => element.dataset.sourcePath === entry.path);
-      });
-      return { ...entry, page: Math.max(0, page) };
-    });
-  }
-
   function collectReadableBlocks(rootNode) {
     const blocks = [];
     const walk = parent => {
@@ -693,7 +520,7 @@ window.ReaderApp = (function () {
         }
         if (child.nodeType !== Node.ELEMENT_NODE) continue;
         if (BLOCK_TAGS.has(child.tagName)) {
-          // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让每页行数忽多忽少）。
+          // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让排版忽松忽紧）。
           if (child.tagName === 'HR' || child.textContent.trim() || child.querySelector('img,svg,image')) {
             blocks.push(child.cloneNode(true));
           }
@@ -782,40 +609,98 @@ window.ReaderApp = (function () {
     try { return decodeURIComponent(path); } catch (_) { return path; }
   }
 
-  // ---- 渲染 / 翻页 ----
-  function renderPage(index) {
-    if (!active || !active.pages[index]) return;
-    els.page.replaceChildren(active.pages[index].cloneNode(true));
+  // ---- 分栏布局 / 翻页 ----
+  function activate(state) {
+    if (els.page.firstElementChild !== state.contentNode) els.page.replaceChildren(state.contentNode);
+    measure(state);
+    if (state.restoreRatio != null) {
+      state.currentPage = Math.round(state.restoreRatio * Math.max(0, state.pageCount - 1));
+      state.restoreRatio = null;
+    }
+    goToPage(state, state.currentPage);
+  }
+
+  function measure(state) {
+    const node = state.contentNode;
+    const width = els.viewport.clientWidth;
+    const height = els.viewport.clientHeight;
+    let sidePad = Math.round(Math.min(Math.max(width * 0.055, 16), 44));
+    if (width - 2 * sidePad > MAX_COLUMN) sidePad = Math.round((width - MAX_COLUMN) / 2);
+    node.style.height = `${height}px`;
+    node.style.padding = `28px ${sidePad}px 24px`;
+    node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
+    node.style.columnGap = `${2 * sidePad}px`;
+    node.style.transform = 'translateX(0px)';
+    state.pageWidth = width;
+    state.pageHeight = height;
+    state.pageCount = Math.max(1, Math.round(node.scrollWidth / width));
+    mapTocPages(state);
+  }
+
+  function goToPage(state, index) {
+    state.currentPage = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
+    state.contentNode.style.transform = `translateX(${-state.currentPage * state.pageWidth}px)`;
     updateTocActive();
   }
 
+  function mapTocPages(state) {
+    const node = state.contentNode;
+    const baseLeft = node.getBoundingClientRect().left;
+    state.tocEntries = (state.toc || []).map((entry, index) => {
+      const target = findTocTarget(state, entry, index);
+      let page = 0;
+      if (target) page = Math.max(0, Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageWidth));
+      return { ...entry, page: Math.min(page, state.pageCount - 1) };
+    });
+  }
+
+  function findTocTarget(state, entry, index) {
+    const node = state.contentNode;
+    if (state.kind === 'txt') return node.querySelector(`[data-toc="${index}"]`);
+    if (entry.fragment) {
+      const byId = Array.from(node.querySelectorAll('[id]')).find(element => element.id === entry.fragment);
+      if (byId) return byId;
+    }
+    return Array.from(node.querySelectorAll('[data-source-path]')).find(element => element.dataset.sourcePath === entry.path) || null;
+  }
+
   function turnPage(direction) {
-    if (repaginating || !active) return;
+    if (!active) return;
     const target = active.currentPage + (direction === 'next' ? 1 : -1);
-    if (target < 0 || target >= active.pages.length) return;
-    active.currentPage = target;
-    renderPage(active.currentPage);
+    if (target < 0 || target >= active.pageCount) return;
+    goToPage(active, target);
     updatePageLabel();
     queueProgressSave(active.currentPage);
   }
 
   function previous() { turnPage('prev'); }
   function next() { turnPage('next'); }
+
+  function seekTo(page, save = true) {
+    if (!active) return;
+    goToPage(active, page);
+    updatePageLabel();
+    if (save) queueProgressSave(active.currentPage);
+  }
+
+  function relayoutActive() {
+    if (!active || !isVisible()) return;
+    const ratio = active.pageCount > 1 ? active.currentPage / (active.pageCount - 1) : 0;
+    measure(active);
+    goToPage(active, Math.round(ratio * Math.max(0, active.pageCount - 1)));
+    renderToc();
+    updatePageLabel();
+    queueProgressSave(active.currentPage);
+  }
+
   function toggleTools() {
     els.themeRoot.classList.toggle('tools-hidden');
     if (els.themeRoot.classList.contains('tools-hidden')) els.fontPopover?.classList.add('hidden');
   }
+
   function toggleTheme() {
     els.themeRoot.classList.toggle('dark');
     try { localStorage.setItem('reader-theme', els.themeRoot.classList.contains('dark') ? 'dark' : 'light'); } catch (_) {}
-  }
-
-  function seekTo(page, save = true) {
-    if (!active) return;
-    active.currentPage = Math.min(Math.max(0, page), Math.max(0, active.pages.length - 1));
-    renderPage(active.currentPage);
-    updatePageLabel();
-    if (save) queueProgressSave(active.currentPage);
   }
 
   function stepFontSize(delta) {
@@ -837,6 +722,7 @@ window.ReaderApp = (function () {
     } catch (_) {}
   }
 
+  // ---- 目录 ----
   function renderToc() {
     const list = els.tocList;
     const entries = active?.tocEntries || [];
@@ -847,8 +733,7 @@ window.ReaderApp = (function () {
     list.innerHTML = entries.map((entry, index) => `<button class="toc-item" data-toc-index="${index}" style="--toc-indent:${Math.min(4, entry.depth || 0) * 16}px">${escapeHtml(entry.label)}</button>`).join('');
     list.querySelectorAll('[data-toc-index]').forEach(button => button.onclick = () => {
       const entry = active.tocEntries[Number(button.dataset.tocIndex)];
-      active.currentPage = Math.min(active.pages.length - 1, Math.max(0, entry.page));
-      renderPage(active.currentPage);
+      goToPage(active, entry.page);
       updatePageLabel();
       queueProgressSave(active.currentPage);
       closeToc();
@@ -886,10 +771,10 @@ window.ReaderApp = (function () {
 
   function updatePageLabel() {
     if (!active) return;
-    const percentage = active.pages.length <= 1 ? 100 : Math.round((active.currentPage / (active.pages.length - 1)) * 100);
-    els.pageLabel.textContent = `${active.currentPage + 1} / ${active.pages.length} · ${percentage}%`;
+    const percentage = active.pageCount <= 1 ? 100 : Math.round((active.currentPage / (active.pageCount - 1)) * 100);
+    els.pageLabel.textContent = `${active.currentPage + 1} / ${active.pageCount} · ${percentage}%`;
     if (els.slider) {
-      els.slider.max = Math.max(0, active.pages.length - 1);
+      els.slider.max = Math.max(0, active.pageCount - 1);
       els.slider.value = active.currentPage;
     }
   }
@@ -897,7 +782,7 @@ window.ReaderApp = (function () {
   function queueProgressSave(page) {
     if (!active) return;
     const bookId = active.bookId;
-    const totalPages = active.pages.length;
+    const totalPages = active.pageCount;
     progressSaveChain = progressSaveChain.then(() => api(`/api/books/${bookId}/progress`, {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ page, total_pages: totalPages }), keepalive: true,
     })).catch(error => console.error('保存阅读进度失败', error));
@@ -912,18 +797,12 @@ window.ReaderApp = (function () {
   function nextFrame() { return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); }
   function escapeHtml(value) { const div = document.createElement('div'); div.textContent = value; return div.innerHTML; }
 
-  function requestRepagination() {
-    if (!active || !isVisible()) return;
-    if (repaginating) repaginationPending = true;
-    else paginateState(active, true);
-  }
-
   function setReaderFontSize(size) {
     const pixels = Math.max(14, Math.min(32, Number(size) || 18));
     document.documentElement.style.setProperty('--reader-font-size', `${pixels}px`);
     if (els.fontSlider) els.fontSlider.value = pixels;
     try { localStorage.setItem('reader-font-size', pixels); } catch (_) {}
-    requestRepagination();
+    relayoutActive();
   }
   window.setReaderFontSize = setReaderFontSize;
 
@@ -935,8 +814,7 @@ window.ReaderApp = (function () {
     if (!state || !state.bookId) return;
     await openBook(state.bookId, {});
     if (active && Number.isFinite(state.page)) {
-      active.currentPage = Math.min(Math.max(0, state.page), Math.max(0, active.pages.length - 1));
-      renderPage(active.currentPage);
+      goToPage(active, state.page);
       updatePageLabel();
     }
   }

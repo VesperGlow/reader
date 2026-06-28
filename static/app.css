@@ -79,6 +79,18 @@ body.reader-open{overflow:hidden}
 .font-popover #font-slider{width:150px}
 .font-step{border:1px solid var(--line);border-radius:8px;background:transparent;color:var(--ink);cursor:pointer;padding:5px 9px;font-size:13px}
 .tools-hidden .font-popover{display:none}
+/* 分栏正文：整本书放进一个多栏容器，每栏=一屏，靠 transform 切页 */
+.book-content{box-sizing:border-box;column-fill:auto;font-family:Georgia,"Noto Serif SC",serif;font-size:var(--reader-font-size,clamp(17px,2vw,20px));line-height:1.7;color:#29251f;overflow-wrap:anywhere;will-change:transform}
+.book-content.txt{white-space:pre-wrap}
+.book-content .toc-anchor{display:inline}
+.book-content h1,.book-content h2,.book-content h3,.book-content h4{font-family:Georgia,"Noto Serif SC",serif;line-height:1.35;margin:.4em 0 .7em;break-inside:avoid}
+.book-content p{margin:0;text-indent:2em}
+.book-content blockquote,.book-content pre,.book-content figure,.book-content table,.book-content li{margin:.2em 0 .3em}
+.book-content img,.book-content svg,.book-content video{max-width:100%;max-height:96%;object-fit:contain;break-inside:avoid}
+.book-content figure,.book-content table,.book-content pre{break-inside:avoid}
+.book-content table{max-width:100%;border-collapse:collapse}
+.book-content pre{white-space:pre-wrap}
+.dark .book-content{color:#dedbd3}
 .toc-scrim{backdrop-filter:none}
 .dark .reader-bar,.dark .reader-footer{background:#191b1b}
 .dark .reader-icon-btn{background:rgba(255,255,255,.08);color:#dedbd3}
