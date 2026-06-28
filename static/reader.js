@@ -709,6 +709,17 @@ window.ReaderApp = (function () {
     return Array.from(node.querySelectorAll('[data-source-path]')).find(element => element.dataset.sourcePath === entry.path) || null;
   }
 
+  // 点目录时按“当前已稳定的版面”实时算页码，而不是用 measure() 时预存的值。
+  // measure 可能发生在图片/字体尚未加载完之前（手机端尤甚），预存页码会偏前；
+  // 这里 target 与 baseLeft 同受 translateX 平移，相减后与当前翻页位置无关，结果精确。
+  function tocTargetPage(state, entry, index) {
+    const target = findTocTarget(state, entry, index);
+    if (!target) return Math.max(0, entry.page || 0);
+    const baseLeft = state.contentNode.getBoundingClientRect().left;
+    const page = Math.round((target.getBoundingClientRect().left - baseLeft) / state.pageStep);
+    return Math.min(Math.max(0, page), Math.max(0, state.pageCount - 1));
+  }
+
   function turnPage(direction) {
     if (!active) return;
     const target = active.currentPage + (direction === 'next' ? 1 : -1);
@@ -833,8 +844,9 @@ window.ReaderApp = (function () {
     }
     list.innerHTML = entries.map((entry, index) => `<button class="toc-item" data-toc-index="${index}" style="--toc-indent:${Math.min(4, entry.depth || 0) * 16}px">${escapeHtml(entry.label)}</button>`).join('');
     list.querySelectorAll('[data-toc-index]').forEach(button => button.onclick = () => {
-      const entry = active.tocEntries[Number(button.dataset.tocIndex)];
-      goToPage(active, entry.page);
+      const index = Number(button.dataset.tocIndex);
+      const entry = active.tocEntries[index];
+      goToPage(active, tocTargetPage(active, entry, index));
       updatePageLabel();
       queueProgressSave(active.currentPage);
       closeToc();
