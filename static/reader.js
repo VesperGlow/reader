@@ -601,6 +601,12 @@ window.ReaderApp = (function () {
       element.removeAttribute('srcset');
       if (element.tagName === 'IMG' && typeof element.decode === 'function') {
         try { await element.decode(); } catch (_) {}
+        // 把图片固有宽高写回属性：克隆到正文后浏览器无需等像素加载即可按宽高比预留版位，
+        // 避免图片迟到引发重排——否则分栏页码会算在图片真正落位之前（手机端尤甚）。
+        if (element.naturalWidth && element.naturalHeight && !element.hasAttribute('width') && !element.hasAttribute('height')) {
+          element.setAttribute('width', element.naturalWidth);
+          element.setAttribute('height', element.naturalHeight);
+        }
       }
     }));
   }
