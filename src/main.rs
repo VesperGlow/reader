@@ -99,8 +99,12 @@ struct Progress {
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("启动失败: {error}");
+    let result = match std::env::args().nth(1).as_deref() {
+        Some("create-admin") | Some("create-user") => create_user_cli(),
+        _ => run().await,
+    };
+    if let Err(error) = result {
+        eprintln!("错误: {error}");
         std::process::exit(1);
     }
 }
@@ -111,45 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let books_dir = data_dir.join("books");
     fs::create_dir_all(&books_dir).await?;
 
-    let connection = Connection::open(data_dir.join("reader.db"))?;
-    connection.execute_batch(
-        "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS users (
-             id INTEGER PRIMARY KEY,
-             username TEXT NOT NULL UNIQUE,
-             password_hash TEXT NOT NULL,
-             created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS sessions (
-             token_hash TEXT PRIMARY KEY,
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             expires_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS books (
-             id INTEGER PRIMARY KEY,
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             title TEXT NOT NULL,
-             kind TEXT NOT NULL,
-             stored_name TEXT NOT NULL UNIQUE,
-             size INTEGER NOT NULL,
-             created_at INTEGER NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS reading_progress (
-             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-             book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-             page INTEGER NOT NULL DEFAULT 0,
-             updated_at INTEGER NOT NULL,
-             PRIMARY KEY(user_id, book_id)
-         );
-         CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
-         CREATE INDEX IF NOT EXISTS books_user_id ON books(user_id);"
-    )?;
-    ensure_column(&connection, "books", "author", "TEXT")?;
-    ensure_column(&connection, "books", "series_name", "TEXT")?;
-    ensure_column(&connection, "books", "series_index", "REAL")?;
-    ensure_column(&connection, "books", "updated_at", "INTEGER")?;
-    ensure_column(&connection, "reading_progress", "total_pages", "INTEGER")?;
+    let connection = open_database(&data_dir)?;
 
     let state = AppState { db: Arc::new(Mutex::new(connection)), books_dir: Arc::new(books_dir) };
     let app = Router::new()
@@ -447,6 +413,92 @@ async fn save_progress(State(state): State<AppState>, headers: HeaderMap, AxumPa
         params![user_id, id, input.page, now(), input.total_pages],
     ).map_err(|_| AppError::internal("保存进度失败"))?;
     Ok(Json(Progress { page: input.page, total_pages: input.total_pages }))
+}
+
+fn open_database(data_dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
+    let connection = Connection::open(data_dir.join("reader.db"))?;
+    connection.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         CREATE TABLE IF NOT EXISTS users (
+             id INTEGER PRIMARY KEY,
+             username TEXT NOT NULL UNIQUE,
+             password_hash TEXT NOT NULL,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS sessions (
+             token_hash TEXT PRIMARY KEY,
+             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             expires_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS books (
+             id INTEGER PRIMARY KEY,
+             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             title TEXT NOT NULL,
+             kind TEXT NOT NULL,
+             stored_name TEXT NOT NULL UNIQUE,
+             size INTEGER NOT NULL,
+             created_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS reading_progress (
+             user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+             book_id INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+             page INTEGER NOT NULL DEFAULT 0,
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY(user_id, book_id)
+         );
+         CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
+         CREATE INDEX IF NOT EXISTS books_user_id ON books(user_id);",
+    )?;
+    ensure_column(&connection, "books", "author", "TEXT")?;
+    ensure_column(&connection, "books", "series_name", "TEXT")?;
+    ensure_column(&connection, "books", "series_index", "REAL")?;
+    ensure_column(&connection, "books", "updated_at", "INTEGER")?;
+    ensure_column(&connection, "reading_progress", "total_pages", "INTEGER")?;
+    Ok(connection)
+}
+
+// 交互式创建账号：`rust-reader create-admin`。没有公开注册，账号只用于防白嫖与爆破。
+fn create_user_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = PathBuf::from(std::env::var("READER_DATA_DIR").unwrap_or_else(|_| "data".into()));
+    std::fs::create_dir_all(data_dir.join("books"))?;
+    let connection = open_database(&data_dir)?;
+
+    let username = prompt("用户名 (3-32 位): ")?;
+    let username = username.trim();
+    let name_length = username.chars().count();
+    if !(3..=32).contains(&name_length) {
+        return Err("用户名长度需为 3 到 32 位".into());
+    }
+
+    let password = prompt("密码 (8-128 位): ")?;
+    let confirm = prompt("确认密码: ")?;
+    if password != confirm {
+        return Err("两次输入的密码不一致".into());
+    }
+    let password_length = password.chars().count();
+    if !(8..=128).contains(&password_length) {
+        return Err("密码长度需为 8 到 128 位".into());
+    }
+
+    let salt_seed = Uuid::new_v4();
+    let salt = SaltString::encode_b64(salt_seed.as_bytes()).map_err(|error| format!("生成密码盐失败: {error}"))?;
+    let hash = Argon2::default().hash_password(password.as_bytes(), &salt).map_err(|error| format!("密码哈希失败: {error}"))?.to_string();
+
+    connection
+        .execute("INSERT INTO users(username, password_hash, created_at) VALUES(?1, ?2, ?3)", params![username, hash, now()])
+        .map_err(|error| format!("创建用户失败（用户名可能已存在）: {error}"))?;
+    println!("已创建用户：{username}");
+    Ok(())
+}
+
+fn prompt(label: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    print!("{label}");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
 }
 
 fn ensure_column(connection: &Connection, table: &str, column: &str, definition: &str) -> rusqlite::Result<()> {
