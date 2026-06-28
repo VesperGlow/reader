@@ -11,6 +11,7 @@ window.Shelf = (function () {
   let coverObserver;
   let coverQueue = Promise.resolve();
   let managementMode = null;
+  let suppressClick = 0;
   const selectedIds = new Set();
   const coverUrls = new Set();
   const coverBlobs = new Map();
@@ -148,11 +149,19 @@ window.Shelf = (function () {
   }
 
   function bindRenderedCards() {
-    document.querySelectorAll('[data-open]').forEach(element => element.onclick = () => {
+    document.querySelectorAll('[data-open]').forEach(element => {
       const id = Number(element.dataset.open);
-      if (managementMode === 'delete') return toggleSelection([id]);
-      if (managementMode === 'edit') return openEditor(id);
-      window.Router.navigate(`/read/${id}`);
+      element.onclick = () => {
+        if (Date.now() < suppressClick) return; // 刚触发过长按编辑，吞掉这次点击
+        if (managementMode === 'delete') return toggleSelection([id]);
+        if (managementMode === 'edit') return openEditor(id);
+        window.Router.navigate(`/read/${id}`);
+      };
+      attachLongPress(element, () => {
+        if (managementMode) return;
+        suppressClick = Date.now() + 700;
+        openEditor(id);
+      });
     });
     document.querySelectorAll('[data-series-card]').forEach(element => element.querySelector('.book-cover').onclick = () => {
       if (managementMode === 'delete') return toggleSelection(element.dataset.selectIds.split(',').map(Number));
@@ -368,7 +377,7 @@ window.Shelf = (function () {
   }
 
   function isManaging() { return Boolean(managementMode); }
-  function isEditorOpen() { return $('#book-editor').open; }
+  function isEditorOpen() { return $('#book-editor').open || $('#password-editor').open; }
 
   function toggleSelection(ids) {
     const select = ids.some(id => !selectedIds.has(id));
@@ -390,7 +399,18 @@ window.Shelf = (function () {
     $('#editor-author').value = book.author || '';
     $('#editor-series').value = book.series_name || '';
     $('#editor-series-index').value = book.series_index ?? '';
-    $('#book-editor').showModal();
+    if (!$('#book-editor').open) $('#book-editor').showModal();
+  }
+
+  // 长按（移动端）/ 右键（桌面）触发编辑。
+  function attachLongPress(element, handler) {
+    let timer = null;
+    const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
+    element.addEventListener('touchstart', () => { clear(); timer = setTimeout(handler, 500); }, { passive: true });
+    element.addEventListener('touchend', clear);
+    element.addEventListener('touchmove', clear);
+    element.addEventListener('touchcancel', clear);
+    element.addEventListener('contextmenu', event => { event.preventDefault(); handler(); });
   }
 
   async function handleUpload(event) {
@@ -453,6 +473,27 @@ window.Shelf = (function () {
       catch (error) { toast(error.message); await loadBooks(); }
     };
     $('#settings-button').onclick = () => $('#settings-panel').classList.toggle('hidden');
+    $('#change-password').onclick = () => {
+      $('#pw-current').value = '';
+      $('#pw-new').value = '';
+      $('#pw-confirm').value = '';
+      $('#pw-error').textContent = '';
+      $('#password-editor').showModal();
+    };
+    $('#password-close').onclick = () => $('#password-editor').close();
+    $('#password-form').onsubmit = async event => {
+      event.preventDefault();
+      $('#pw-error').textContent = '';
+      const current = $('#pw-current').value;
+      const next = $('#pw-new').value;
+      if (next !== $('#pw-confirm').value) { $('#pw-error').textContent = '两次输入的新密码不一致'; return; }
+      if (next.length < 8) { $('#pw-error').textContent = '新密码至少 8 位'; return; }
+      try {
+        await api('/api/password', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ current_password: current, new_password: next }) });
+        $('#password-editor').close();
+        toast('密码已修改');
+      } catch (error) { $('#pw-error').textContent = error.message; }
+    };
     $('#compact-shelf').onchange = event => {
       try { localStorage.setItem('reader-compact-shelf', event.target.checked); } catch (_) {}
       $('#shelf-view').classList.toggle('compact-shelf', event.target.checked);

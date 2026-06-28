@@ -1,6 +1,6 @@
 use std::{path::{Path, PathBuf}, sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
-use argon2::{Argon2, password_hash::{PasswordHash, PasswordVerifier}};
+use argon2::{Argon2, password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString}};
 use axum::{
     Json, Router,
     body::Body,
@@ -54,6 +54,9 @@ struct ApiMessage { message: String }
 
 #[derive(Deserialize)]
 struct AuthInput { username: String, password: String }
+
+#[derive(Deserialize)]
+struct PasswordChange { current_password: String, new_password: String }
 
 #[derive(Serialize)]
 struct Me { id: i64, username: String }
@@ -161,6 +164,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
+        .route("/api/password", post(change_password))
         .route("/api/books", get(list_books).post(upload_book))
         .route("/api/books/{id}", delete(delete_book).patch(update_book))
         .route("/api/books/{id}/file", get(book_file))
@@ -221,6 +225,31 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Me>> {
     let (id, username) = authenticated_user(&state, &headers).await?;
     Ok(Json(Me { id, username }))
+}
+
+async fn change_password(State(state): State<AppState>, headers: HeaderMap, Json(input): Json<PasswordChange>) -> AppResult<Json<ApiMessage>> {
+    let (user_id, _) = authenticated_user(&state, &headers).await?;
+    let new_length = input.new_password.chars().count();
+    if !(8..=128).contains(&new_length) {
+        return Err(AppError::bad_request("新密码长度需为 8 到 128 位"));
+    }
+    let stored_hash = {
+        let db = state.db.lock().await;
+        db.query_row("SELECT password_hash FROM users WHERE id = ?1", [user_id], |row| row.get::<_, String>(0))
+            .optional().map_err(|_| AppError::internal("读取账户失败"))?
+    }.ok_or_else(AppError::unauthorized)?;
+    let parsed = PasswordHash::new(&stored_hash).map_err(|_| AppError::internal("账户密码数据无效"))?;
+    if Argon2::default().verify_password(input.current_password.as_bytes(), &parsed).is_err() {
+        return Err(AppError::bad_request("当前密码错误"));
+    }
+    let salt_seed = Uuid::new_v4();
+    let salt = SaltString::encode_b64(salt_seed.as_bytes()).map_err(|_| AppError::internal("生成密码盐失败"))?;
+    let new_hash = Argon2::default().hash_password(input.new_password.as_bytes(), &salt)
+        .map_err(|_| AppError::internal("密码哈希失败"))?.to_string();
+    let db = state.db.lock().await;
+    db.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![new_hash, user_id])
+        .map_err(|_| AppError::internal("更新密码失败"))?;
+    Ok(Json(ApiMessage { message: "密码已修改".into() }))
 }
 
 async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Vec<Book>>> {
