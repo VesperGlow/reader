@@ -582,6 +582,21 @@ window.ReaderApp = (function () {
       element.removeAttribute('align');
     });
     doc.querySelectorAll('style,link[rel="stylesheet"]').forEach(node => node.remove());
+    // Calibre 等导出器把整页封面写成 <svg viewBox><image/></svg>。内联 SVG 里的位图
+    // 在合成层(.book-content will-change:transform)里常被按固有尺寸栅格化后再放大，
+    // 封面因此发虚/马赛克；这里把“只裹一张图”的 SVG 拆成等价 <img>，走普通图片渲染
+    // 路径——既清晰，又能复用 localizeAssets 里的 decode + 写回宽高预留版位逻辑。
+    doc.querySelectorAll('svg').forEach(svg => {
+      const inner = svg.querySelectorAll('*');
+      if (inner.length !== 1 || inner[0].localName !== 'image') return;
+      const href = inner[0].getAttribute('href') || inner[0].getAttribute('xlink:href');
+      if (!href) return;
+      const img = doc.createElement('img');
+      img.setAttribute('src', href);
+      const alt = svg.getAttribute('aria-label') || inner[0].getAttribute('alt') || '';
+      if (alt) img.setAttribute('alt', alt);
+      svg.replaceWith(img);
+    });
   }
 
   async function localizeAssets(doc, chapterPath, zip, mimeByPath, cache) {
