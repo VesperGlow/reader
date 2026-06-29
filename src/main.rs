@@ -10,11 +10,15 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{fs, net::TcpListener, sync::Mutex};
+use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
+
+type DbPool = r2d2::Pool<SqliteConnectionManager>;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const READER_HTML: &str = include_str!("../static/reader.html");
@@ -33,7 +37,7 @@ const SECURITY_HEADER_CSP: &str = "default-src 'self'; script-src 'self'; style-
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Connection>>,
+    db: DbPool,
     books_dir: Arc<PathBuf>,
     login_attempts: Arc<std::sync::Mutex<HashMap<String, LoginAttempt>>>,
     // 用户名不存在时拿它跑一次等价的 Argon2 校验，抹平时序，避免用户名枚举。
@@ -130,7 +134,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let books_dir = data_dir.join("books");
     fs::create_dir_all(&books_dir).await?;
 
-    let connection = open_database(&data_dir)?;
+    // 先用单连接建表/迁移（WAL 是持久化到库文件的，对后续所有连接生效），随后切到连接池。
+    drop(open_database(&data_dir)?);
+    let manager = SqliteConnectionManager::file(data_dir.join("reader.db"))
+        // foreign_keys 是“按连接”生效的，池里每条连接都要重新打开；busy_timeout 让并发写时不要立刻 SQLITE_BUSY。
+        .with_init(|connection| connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"));
+    let pool = r2d2::Pool::builder().max_size(8).build(manager)?;
 
     let dummy_salt = SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(|error| format!("生成时序盐失败: {error}"))?;
     let dummy_hash = Argon2::default().hash_password(b"timing-equalizer", &dummy_salt).map_err(|error| format!("生成时序哈希失败: {error}"))?.to_string();
@@ -140,7 +149,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let state = AppState {
-        db: Arc::new(Mutex::new(connection)),
+        db: pool,
         books_dir: Arc::new(books_dir),
         login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         dummy_hash: Arc::new(dummy_hash),
@@ -212,7 +221,7 @@ async fn login(
     let ip = client_ip(&headers, Some(addr));
     rate_limit_check(&state, &ip)?;
     let record = {
-        let db = state.db.lock().await;
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.query_row("SELECT id, password_hash FROM users WHERE username = ?1", [input.username.trim()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
             .optional().map_err(|_| AppError::internal("登录失败"))?
     };
@@ -233,7 +242,7 @@ async fn login(
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Response> {
     if let Some(token) = cookie_value(&headers, "reader_session") {
-        let db = state.db.lock().await;
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.execute("DELETE FROM sessions WHERE token_hash = ?1", [hash_token(&token)])
             .map_err(|_| AppError::internal("退出失败"))?;
     }
@@ -255,7 +264,7 @@ async fn change_password(State(state): State<AppState>, headers: HeaderMap, Json
         return Err(AppError::bad_request("新密码长度需为 8 到 128 位"));
     }
     let stored_hash = {
-        let db = state.db.lock().await;
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.query_row("SELECT password_hash FROM users WHERE id = ?1", [user_id], |row| row.get::<_, String>(0))
             .optional().map_err(|_| AppError::internal("读取账户失败"))?
     }.ok_or_else(AppError::unauthorized)?;
@@ -267,7 +276,7 @@ async fn change_password(State(state): State<AppState>, headers: HeaderMap, Json
     let salt = SaltString::encode_b64(salt_seed.as_bytes()).map_err(|_| AppError::internal("生成密码盐失败"))?;
     let new_hash = Argon2::default().hash_password(input.new_password.as_bytes(), &salt)
         .map_err(|_| AppError::internal("密码哈希失败"))?.to_string();
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     db.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![new_hash, user_id])
         .map_err(|_| AppError::internal("更新密码失败"))?;
     Ok(Json(ApiMessage { message: "密码已修改".into() }))
@@ -275,7 +284,7 @@ async fn change_password(State(state): State<AppState>, headers: HeaderMap, Json
 
 async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> AppResult<Json<Vec<Book>>> {
     let (user_id, _) = authenticated_user(&state, &headers).await?;
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     let mut statement = db.prepare(
         "SELECT books.id, books.title, books.kind, books.size, books.created_at,
                 books.author, books.series_name, books.series_index,
@@ -313,32 +322,70 @@ async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> AppRes
 
 async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut multipart: Multipart) -> AppResult<Json<Book>> {
     let (user_id, _) = authenticated_user(&state, &headers).await?;
-    let field = multipart.next_field().await.map_err(|_| AppError::bad_request("上传数据无效"))?
+    let mut field = multipart.next_field().await.map_err(|_| AppError::bad_request("上传数据无效"))?
         .ok_or_else(|| AppError::bad_request("请选择文件"))?;
     let original_name = field.file_name().unwrap_or("未命名").to_string();
     let extension = Path::new(&original_name).extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     if extension != "epub" && extension != "txt" { return Err(AppError::bad_request("只支持 EPUB 和 TXT 文件")); }
-    let mut data = field.bytes().await.map_err(|_| AppError::bad_request("无法读取上传文件"))?.to_vec();
-    if data.is_empty() || data.len() > MAX_BOOK_SIZE { return Err(AppError::bad_request("文件应在 1 字节到 64 MB 之间")); }
-    if extension == "epub" && !data.starts_with(b"PK") { return Err(AppError::bad_request("EPUB 文件格式无效")); }
-    if extension == "txt" && std::str::from_utf8(&data).is_err() {
-        let (decoded, _, _) = encoding_rs::GBK.decode(&data);
-        data = decoded.into_owned().into_bytes();
-    }
 
     let stored_name = format!("{}.{}", Uuid::new_v4(), extension);
     let path = state.books_dir.join(&stored_name);
-    fs::write(&path, &data).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    let temp_path = state.books_dir.join(format!(".{}.tmp", Uuid::new_v4()));
+
+    // 流式把上传内容写进临时文件：每次只持有一个分片，边写边卡 64MB 上限，避免整本书堆在内存里。
+    let mut total: usize = 0;
+    let mut head: Vec<u8> = Vec::with_capacity(2); // 只缓存头两字节，用于 EPUB 的 "PK" 校验
+    let stream_result: AppResult<()> = async {
+        let mut file = fs::File::create(&temp_path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        while let Some(chunk) = field.chunk().await.map_err(|_| AppError::bad_request("无法读取上传文件"))? {
+            total += chunk.len();
+            if total > MAX_BOOK_SIZE { return Err(AppError::bad_request("文件应在 1 字节到 64 MB 之间")); }
+            for &byte in chunk.iter() {
+                if head.len() >= 2 { break; }
+                head.push(byte);
+            }
+            file.write_all(&chunk).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        }
+        file.flush().await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        Ok(())
+    }.await;
+    if let Err(error) = stream_result {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(error);
+    }
+    if total == 0 {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(AppError::bad_request("文件应在 1 字节到 64 MB 之间"));
+    }
+    if extension == "epub" && !head.starts_with(b"PK") {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(AppError::bad_request("EPUB 文件格式无效"));
+    }
+    // TXT：非 UTF-8 则按 GBK 解码后回写。TXT 体积小、整体读回内存可接受；真正的大文件是 EPUB，已全程流式落盘。
+    if extension == "txt" {
+        let raw = fs::read(&temp_path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        if std::str::from_utf8(&raw).is_err() {
+            let (decoded, _, _) = encoding_rs::GBK.decode(&raw);
+            let converted = decoded.into_owned().into_bytes();
+            total = converted.len();
+            fs::write(&temp_path, &converted).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        }
+    }
+    if let Err(error) = fs::rename(&temp_path, &path).await {
+        let _ = fs::remove_file(&temp_path).await;
+        return Err(AppError::internal(format!("保存书籍失败: {error}")));
+    }
+    let size = total as i64;
     let title = Path::new(&original_name).file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").trim().to_string();
     let created_at = now();
     let insert_result = {
-        let db = state.db.lock().await;
-        db.execute("INSERT INTO books(user_id, title, kind, stored_name, size, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)", params![user_id, title, extension, stored_name, data.len() as i64, created_at])
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.execute("INSERT INTO books(user_id, title, kind, stored_name, size, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)", params![user_id, title, extension, stored_name, size, created_at])
             .map(|_| Book {
                 id: db.last_insert_rowid(),
                 title,
                 kind: extension,
-                size: data.len() as i64,
+                size,
                 created_at,
                 author: None,
                 series_name: None,
@@ -381,7 +428,7 @@ async fn update_book(
     {
         return Err(AppError::bad_request("书籍信息过长"));
     }
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     let changed = db.execute(
         "UPDATE books SET
              title = COALESCE(?1, title),
@@ -412,32 +459,39 @@ async fn update_book(
 async fn book_file(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Response> {
     let (user_id, _) = authenticated_user(&state, &headers).await?;
     let record = {
-        let db = state.db.lock().await;
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.query_row("SELECT stored_name, kind FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
             .optional().map_err(|_| AppError::internal("读取书籍失败"))?
     }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
-    let data = fs::read(state.books_dir.join(record.0)).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "书籍文件不存在".into()))?;
+    // 流式回传：每次只用约 8KB 缓冲，避免把整本书读进内存（慢客户端会让大文件长时间占用内存）。
+    let file = fs::File::open(state.books_dir.join(record.0)).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "书籍文件不存在".into()))?;
+    let content_length = file.metadata().await.map(|meta| meta.len()).ok();
     let content_type = if record.1 == "epub" { "application/epub+zip" } else { "text/plain; charset=utf-8" };
-    Response::builder().header(header::CONTENT_TYPE, content_type).header(header::CACHE_CONTROL, "private, max-age=3600")
-        .body(Body::from(data)).map_err(|_| AppError::internal("创建响应失败"))
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=3600");
+    if let Some(length) = content_length {
+        builder = builder.header(header::CONTENT_LENGTH, length);
+    }
+    builder.body(Body::from_stream(ReaderStream::new(file))).map_err(|_| AppError::internal("创建响应失败"))
 }
 
 async fn delete_book(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Json<ApiMessage>> {
     let (user_id, _) = authenticated_user(&state, &headers).await?;
     let stored_name = {
-        let db = state.db.lock().await;
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.query_row("SELECT stored_name FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |row| row.get::<_, String>(0))
             .optional().map_err(|_| AppError::internal("删除书籍失败"))?
     }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
     let _ = fs::remove_file(state.books_dir.join(stored_name)).await;
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     db.execute("DELETE FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id]).map_err(|_| AppError::internal("删除书籍失败"))?;
     Ok(Json(ApiMessage { message: "已删除".into() }))
 }
 
 async fn get_progress(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Json<Progress>> {
     let (user_id, _) = authenticated_user(&state, &headers).await?;
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     let owns_book = db.query_row("SELECT 1 FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |_| Ok(()))
         .optional().map_err(|_| AppError::internal("读取进度失败"))?.is_some();
     if !owns_book { return Err(AppError(StatusCode::NOT_FOUND, "书籍不存在".into())); }
@@ -455,7 +509,7 @@ async fn save_progress(State(state): State<AppState>, headers: HeaderMap, AxumPa
     if input.total_pages.is_some_and(|value| value < 1 || value > i32::MAX as i64) {
         return Err(AppError::bad_request("总页数无效"));
     }
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     let owns_book = db.query_row("SELECT 1 FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |_| Ok(()))
         .optional().map_err(|_| AppError::internal("保存进度失败"))?.is_some();
     if !owns_book { return Err(AppError(StatusCode::NOT_FOUND, "书籍不存在".into())); }
@@ -576,7 +630,7 @@ fn normalize_optional_text(value: String) -> Option<String> {
 
 async fn session_response(state: &AppState, user_id: i64, message: &str, secure: bool) -> AppResult<Response> {
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     db.execute("DELETE FROM sessions WHERE expires_at < ?1", [now()]).map_err(|_| AppError::internal("会话清理失败"))?;
     db.execute("INSERT INTO sessions(token_hash, user_id, expires_at) VALUES(?1, ?2, ?3)", params![hash_token(&token), user_id, now() + SESSION_SECONDS])
         .map_err(|_| AppError::internal("创建会话失败"))?;
@@ -639,7 +693,7 @@ fn rate_limit_reset(state: &AppState, key: &str) {
 
 async fn authenticated_user(state: &AppState, headers: &HeaderMap) -> AppResult<(i64, String)> {
     let token = cookie_value(headers, "reader_session").ok_or_else(AppError::unauthorized)?;
-    let db = state.db.lock().await;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     db.query_row(
         "SELECT users.id, users.username FROM sessions JOIN users ON users.id = sessions.user_id WHERE sessions.token_hash = ?1 AND sessions.expires_at > ?2",
         params![hash_token(&token), now()], |row| Ok((row.get(0)?, row.get(1)?)),
