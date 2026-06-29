@@ -10,11 +10,13 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
 };
+use async_compression::Level;
+use async_compression::tokio::bufread::{ZstdDecoder, ZstdEncoder};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::Semaphore};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::TcpListener, sync::Semaphore};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -143,8 +145,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 先用单连接建表/迁移（WAL 是持久化到库文件的，对后续所有连接生效），随后切到连接池。
     drop(open_database(&data_dir)?);
     let manager = SqliteConnectionManager::file(data_dir.join("reader.db"))
-        // foreign_keys 是“按连接”生效的，池里每条连接都要重新打开；busy_timeout 让并发写时不要立刻 SQLITE_BUSY。
-        .with_init(|connection| connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"));
+        // foreign_keys 是“按连接”生效的，池里每条连接都要重新打开；busy_timeout 让并发写时不要立刻 SQLITE_BUSY；
+        // synchronous=NORMAL 在 WAL 下官方认证安全（仅断电时可能丢最后一两条提交），大幅减少频繁进度写入的 fsync。
+        .with_init(|connection| connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL;"));
     let pool = r2d2::Pool::builder().max_size(8).build(manager)?;
 
     let dummy_salt = SaltString::encode_b64(Uuid::new_v4().as_bytes()).map_err(|error| format!("生成时序盐失败: {error}"))?;
@@ -339,7 +342,12 @@ async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut mult
     let extension = Path::new(&original_name).extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
     if extension != "epub" && extension != "txt" { return Err(AppError::bad_request("只支持 EPUB 和 TXT 文件")); }
 
-    let stored_name = format!("{}.{}", Uuid::new_v4(), extension);
+    // TXT 落盘时用 zstd 压缩，文件名带 .zst 后缀作为标记（下载时据此解压）；EPUB 本身已是 zip 不再压。
+    let stored_name = if extension == "txt" {
+        format!("{}.txt.zst", Uuid::new_v4())
+    } else {
+        format!("{}.{}", Uuid::new_v4(), extension)
+    };
     let path = state.books_dir.join(&stored_name);
     let temp_path = state.books_dir.join(format!(".{}.tmp", Uuid::new_v4()));
 
@@ -373,21 +381,29 @@ async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut mult
         return Err(AppError::bad_request("EPUB 文件格式无效"));
     }
     // TXT：流式判定编码，必要时按 GBK 增量转码为 UTF-8，全程固定缓冲，内存与文件大小无关。
+    // size 记录的是“逻辑大小”（解压后的 UTF-8 字节数），下载时用作 Content-Length。
     let size = if extension == "txt" {
-        match normalize_txt_to_utf8(&temp_path).await {
+        let size = match normalize_txt_to_utf8(&temp_path).await {
             Ok(size) => size,
             Err(error) => {
                 let _ = fs::remove_file(&temp_path).await;
                 return Err(error);
             }
+        };
+        if let Err(error) = compress_file_zstd(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            let _ = fs::remove_file(&path).await;
+            return Err(error);
         }
+        let _ = fs::remove_file(&temp_path).await;
+        size
     } else {
+        if let Err(error) = fs::rename(&temp_path, &path).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::internal(format!("保存书籍失败: {error}")));
+        }
         total as i64
     };
-    if let Err(error) = fs::rename(&temp_path, &path).await {
-        let _ = fs::remove_file(&temp_path).await;
-        return Err(AppError::internal(format!("保存书籍失败: {error}")));
-    }
     let title = Path::new(&original_name).file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").trim().to_string();
     let created_at = now();
     let insert_result = {
@@ -472,20 +488,28 @@ async fn book_file(State(state): State<AppState>, headers: HeaderMap, AxumPath(i
     let (user_id, _) = authenticated_user(&state, &headers).await?;
     let record = {
         let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
-        db.query_row("SELECT stored_name, kind FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        db.query_row("SELECT stored_name, kind, size FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
             .optional().map_err(|_| AppError::internal("读取书籍失败"))?
     }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
+    let (stored_name, kind, logical_size) = record;
     // 流式回传：每次只用约 8KB 缓冲，避免把整本书读进内存（慢客户端会让大文件长时间占用内存）。
-    let file = fs::File::open(state.books_dir.join(record.0)).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "书籍文件不存在".into()))?;
-    let content_length = file.metadata().await.map(|meta| meta.len()).ok();
-    let content_type = if record.1 == "epub" { "application/epub+zip" } else { "text/plain; charset=utf-8" };
+    let file = fs::File::open(state.books_dir.join(&stored_name)).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "书籍文件不存在".into()))?;
+    let content_type = if kind == "epub" { "application/epub+zip" } else { "text/plain; charset=utf-8" };
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "private, max-age=3600");
-    if let Some(length) = content_length {
-        builder = builder.header(header::CONTENT_LENGTH, length);
-    }
-    builder.body(Body::from_stream(ReaderStream::new(file))).map_err(|_| AppError::internal("创建响应失败"))
+    let body = if stored_name.ends_with(".zst") {
+        // 压缩存储的 TXT：边读边 zstd 解压回传；解压后长度就是入库时记录的 size。
+        builder = builder.header(header::CONTENT_LENGTH, logical_size as u64);
+        Body::from_stream(ReaderStream::new(ZstdDecoder::new(BufReader::new(file))))
+    } else {
+        // 未压缩（EPUB，或本次改动之前上传的旧 TXT）：直接流式回传。
+        if let Ok(meta) = file.metadata().await {
+            builder = builder.header(header::CONTENT_LENGTH, meta.len());
+        }
+        Body::from_stream(ReaderStream::new(file))
+    };
+    builder.body(body).map_err(|_| AppError::internal("创建响应失败"))
 }
 
 async fn delete_book(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Json<ApiMessage>> {
@@ -714,6 +738,16 @@ async fn decode_gbk_to_utf8_file(src: &Path, dst: &Path) -> AppResult<i64> {
     }
     output.flush().await.map_err(|_| AppError::internal("保存书籍失败"))?;
     Ok(total)
+}
+
+// 流式 zstd 压缩 src -> dst（用于 TXT 落盘）。中文纯文本通常能压到 1/3~1/5；固定缓冲，内存与文件大小无关。
+async fn compress_file_zstd(src: &Path, dst: &Path) -> AppResult<()> {
+    let input = BufReader::new(fs::File::open(src).await.map_err(|_| AppError::internal("保存书籍失败"))?);
+    let mut encoder = ZstdEncoder::with_quality(input, Level::Precise(19));
+    let mut output = fs::File::create(dst).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    tokio::io::copy(&mut encoder, &mut output).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    output.flush().await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    Ok(())
 }
 
 async fn session_response(state: &AppState, user_id: i64, message: &str, secure: bool) -> AppResult<Response> {

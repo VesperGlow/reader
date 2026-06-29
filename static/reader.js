@@ -20,6 +20,8 @@ window.ReaderApp = (function () {
   let active = null; // 当前展示的书 state
   let onExit = null;
   let progressSaveChain = Promise.resolve();
+  let progressSaveTimer = null;
+  const PROGRESS_SAVE_DELAY = 1200; // 翻页停下这么久后才真正写一次，合并快速翻页的连续写入
   let resizeTimer = null;
 
   // state: { bookId, info, kind, contentNode, toc, tocEntries, assetUrls,
@@ -907,17 +909,29 @@ window.ReaderApp = (function () {
     }
   }
 
+  // 翻页时只防抖排期，不立即写；停下 PROGRESS_SAVE_DELAY 后落一次，把连续翻页合并成一次写入。
   function queueProgressSave(page) {
     if (!active) return;
     const bookId = active.bookId;
     const totalPages = active.pageCount;
+    if (progressSaveTimer) clearTimeout(progressSaveTimer);
+    progressSaveTimer = setTimeout(() => {
+      progressSaveTimer = null;
+      commitProgressSave(bookId, totalPages, page);
+    }, PROGRESS_SAVE_DELAY);
+  }
+
+  function commitProgressSave(bookId, totalPages, page) {
     progressSaveChain = progressSaveChain.then(() => api(`/api/books/${bookId}/progress`, {
       method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ page, total_pages: totalPages }), keepalive: true,
     })).catch(error => console.error('保存阅读进度失败', error));
   }
 
+  // 离开页面/切书等场景立即落盘（绕过防抖），确保不丢进度。
   function saveProgress() {
-    if (active) queueProgressSave(active.currentPage);
+    if (!active) return;
+    if (progressSaveTimer) { clearTimeout(progressSaveTimer); progressSaveTimer = null; }
+    commitProgressSave(active.bookId, active.pageCount, active.currentPage);
   }
 
   function setLoading(message) { els.loading.textContent = message; }
