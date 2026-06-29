@@ -14,7 +14,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{fs, io::AsyncWriteExt, net::TcpListener};
+use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::Semaphore};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -33,6 +33,10 @@ const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 // 登录限速：单一来源在窗口内最多尝试次数，超出后返回 429（同时挡住对 Argon2 的 CPU 放大攻击）。
 const LOGIN_MAX_ATTEMPTS: u32 = 10;
 const LOGIN_WINDOW_SECONDS: i64 = 300;
+// 限速表最多跟踪多少个来源 key：防止伪造 X-Forwarded-For 灌入海量不同 key 撑爆内存。
+const LOGIN_MAX_TRACKED_IPS: usize = 4096;
+// 同时进行的 Argon2 哈希数上限：每次哈希约占 19MB，限并发把内存峰值钉死在小盒子能承受的范围。
+const MAX_CONCURRENT_HASHES: usize = 2;
 const SECURITY_HEADER_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 
 #[derive(Clone)]
@@ -44,6 +48,8 @@ struct AppState {
     dummy_hash: Arc<String>,
     // 强制给会话 Cookie 加 Secure（READER_SECURE_COOKIE=1）；否则按 X-Forwarded-Proto 自动判断。
     force_secure_cookie: bool,
+    // 限制并发 Argon2 哈希数，给内存峰值封顶（每次哈希约 19MB）。
+    hash_limit: Arc<Semaphore>,
 }
 
 struct LoginAttempt {
@@ -154,6 +160,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         dummy_hash: Arc::new(dummy_hash),
         force_secure_cookie,
+        hash_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_HASHES)),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -225,6 +232,8 @@ async fn login(
         db.query_row("SELECT id, password_hash FROM users WHERE username = ?1", [input.username.trim()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
             .optional().map_err(|_| AppError::internal("登录失败"))?
     };
+    // 进入 Argon2 前抢一个名额：限并发把内存峰值钉死（即便限速被伪造 IP 绕过，也无法靠并发哈希拖垮内存）。
+    let _hash_permit = state.hash_limit.acquire().await.map_err(|_| AppError::internal("登录失败"))?;
     let Some((user_id, stored_hash)) = record else {
         // 用户不存在也跑一次等价的 Argon2 校验，让响应时间与"密码错误"一致，避免用户名枚举。
         if let Ok(parsed) = PasswordHash::new(state.dummy_hash.as_str()) {
@@ -268,6 +277,8 @@ async fn change_password(State(state): State<AppState>, headers: HeaderMap, Json
         db.query_row("SELECT password_hash FROM users WHERE id = ?1", [user_id], |row| row.get::<_, String>(0))
             .optional().map_err(|_| AppError::internal("读取账户失败"))?
     }.ok_or_else(AppError::unauthorized)?;
+    // 同登录：把校验旧密码 + 哈希新密码这两次 Argon2 纳入并发名额，封住内存峰值。
+    let _hash_permit = state.hash_limit.acquire().await.map_err(|_| AppError::internal("更新密码失败"))?;
     let parsed = PasswordHash::new(&stored_hash).map_err(|_| AppError::internal("账户密码数据无效"))?;
     if Argon2::default().verify_password(input.current_password.as_bytes(), &parsed).is_err() {
         return Err(AppError::bad_request("当前密码错误"));
@@ -361,21 +372,22 @@ async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut mult
         let _ = fs::remove_file(&temp_path).await;
         return Err(AppError::bad_request("EPUB 文件格式无效"));
     }
-    // TXT：非 UTF-8 则按 GBK 解码后回写。TXT 体积小、整体读回内存可接受；真正的大文件是 EPUB，已全程流式落盘。
-    if extension == "txt" {
-        let raw = fs::read(&temp_path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
-        if std::str::from_utf8(&raw).is_err() {
-            let (decoded, _, _) = encoding_rs::GBK.decode(&raw);
-            let converted = decoded.into_owned().into_bytes();
-            total = converted.len();
-            fs::write(&temp_path, &converted).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    // TXT：流式判定编码，必要时按 GBK 增量转码为 UTF-8，全程固定缓冲，内存与文件大小无关。
+    let size = if extension == "txt" {
+        match normalize_txt_to_utf8(&temp_path).await {
+            Ok(size) => size,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(error);
+            }
         }
-    }
+    } else {
+        total as i64
+    };
     if let Err(error) = fs::rename(&temp_path, &path).await {
         let _ = fs::remove_file(&temp_path).await;
         return Err(AppError::internal(format!("保存书籍失败: {error}")));
     }
-    let size = total as i64;
     let title = Path::new(&original_name).file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").trim().to_string();
     let created_at = now();
     let insert_result = {
@@ -628,6 +640,82 @@ fn normalize_optional_text(value: String) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+// 把 TXT 临时文件规范化为 UTF-8，返回最终字节数。本来就是 UTF-8 则原样保留，否则按 GBK 增量转码。
+// 全程固定缓冲，内存与文件大小无关（取代了旧的“整篇读进内存判断/解码”）。
+async fn normalize_txt_to_utf8(temp_path: &Path) -> AppResult<i64> {
+    if is_file_valid_utf8(temp_path).await? {
+        let meta = fs::metadata(temp_path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        return Ok(meta.len() as i64);
+    }
+    let converted = temp_path.with_extension("gbk-utf8.tmp");
+    match decode_gbk_to_utf8_file(temp_path, &converted).await {
+        Ok(size) => {
+            fs::rename(&converted, temp_path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+            Ok(size)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&converted).await;
+            Err(error)
+        }
+    }
+}
+
+// 分块读文件做 UTF-8 校验，跨缓冲边界的不完整多字节序列用 carry 暂存（最多 3 字节）；只占固定缓冲。
+async fn is_file_valid_utf8(path: &Path) -> AppResult<bool> {
+    let mut file = fs::File::open(path).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        let read = file.read(&mut buffer).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        if read == 0 {
+            break;
+        }
+        let mut data = std::mem::take(&mut carry);
+        data.extend_from_slice(&buffer[..read]);
+        if let Err(error) = std::str::from_utf8(&data) {
+            // error_len 有值＝真正的非法序列；为 None＝末尾被截断的不完整字符，留到下一块再拼。
+            if error.error_len().is_some() {
+                return Ok(false);
+            }
+            carry.extend_from_slice(&data[error.valid_up_to()..]);
+        }
+    }
+    // EOF 仍有残留＝末尾是被截断的多字节序列，按非 UTF-8 处理。
+    Ok(carry.is_empty())
+}
+
+// 流式 GBK -> UTF-8 解码写到目标文件，返回写出的 UTF-8 字节数；固定缓冲。
+async fn decode_gbk_to_utf8_file(src: &Path, dst: &Path) -> AppResult<i64> {
+    let mut input = fs::File::open(src).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    let mut output = fs::File::create(dst).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    let mut decoder = encoding_rs::GBK.new_decoder();
+    let mut in_buf = vec![0u8; 64 * 1024];
+    let mut out_buf = vec![0u8; 96 * 1024]; // 双字节汉字最坏膨胀到 3 字节，1.5x 足够；不足由 OutputFull 循环兜底
+    let mut total: i64 = 0;
+    loop {
+        let read = input.read(&mut in_buf).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+        let last = read == 0;
+        let mut offset = 0;
+        loop {
+            let (result, consumed, produced, _) = decoder.decode_to_utf8(&in_buf[offset..read], &mut out_buf, last);
+            if produced > 0 {
+                output.write_all(&out_buf[..produced]).await.map_err(|_| AppError::internal("保存书籍失败"))?;
+                total += produced as i64;
+            }
+            offset += consumed;
+            match result {
+                encoding_rs::CoderResult::InputEmpty => break,
+                encoding_rs::CoderResult::OutputFull => continue,
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    output.flush().await.map_err(|_| AppError::internal("保存书籍失败"))?;
+    Ok(total)
+}
+
 async fn session_response(state: &AppState, user_id: i64, message: &str, secure: bool) -> AppResult<Response> {
     let token = Uuid::new_v4().simple().to_string() + &Uuid::new_v4().simple().to_string();
     let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
@@ -679,6 +767,10 @@ fn rate_limit_check(state: &AppState, key: &str) -> AppResult<()> {
     let now = now();
     let mut attempts = state.login_attempts.lock().unwrap();
     attempts.retain(|_, attempt| attempt.reset_at > now);
+    // 跟踪表已满且是新 key：不再新增（防伪造来源灌爆内存）。并发哈希另由 hash_limit 信号量兜底，这里放行不影响内存安全。
+    if attempts.len() >= LOGIN_MAX_TRACKED_IPS && !attempts.contains_key(key) {
+        return Ok(());
+    }
     let entry = attempts.entry(key.to_string()).or_insert(LoginAttempt { count: 0, reset_at: now + LOGIN_WINDOW_SECONDS });
     if entry.count >= LOGIN_MAX_ATTEMPTS {
         return Err(AppError(StatusCode::TOO_MANY_REQUESTS, "登录尝试过于频繁，请稍后再试".into()));
