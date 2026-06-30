@@ -422,17 +422,20 @@ async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut mult
     };
     let title = Path::new(&original_name).file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").trim().to_string();
     let created_at = now();
-    let book_id = {
+    // 注意：db 连接（rusqlite，非 Send）不能跨 .await 持有，否则 handler future 不是 Send、axum 拒绝。
+    // 先在独立作用域里完成插入并让 db 析构，再在块外做需要 await 的清理。
+    let insert = {
         let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
-        match db.execute(
+        db.execute(
             "INSERT INTO books(user_id, title, kind, stored_name, size, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![user_id, title, extension, stored_name, size, created_at],
-        ) {
-            Ok(_) => db.last_insert_rowid(),
-            Err(_) => {
-                let _ = fs::remove_file(&path).await;
-                return Err(AppError::internal("保存书籍记录失败"));
-            }
+        ).map(|_| db.last_insert_rowid())
+    };
+    let book_id = match insert {
+        Ok(id) => id,
+        Err(_) => {
+            let _ = fs::remove_file(&path).await;
+            return Err(AppError::internal("保存书籍记录失败"));
         }
     };
 
