@@ -7,6 +7,8 @@ edition = "2024"
 argon2 = "0.5.3"
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 axum = { version = "0.8.9", features = ["multipart"] }
+# 必须与 scraper 0.23 依赖的 ego-tree 版本一致（^0.10），否则 NodeRef 类型对不上。
+ego-tree = "0.10"
 encoding_rs = "0.8"
 hex = "0.4.3"
 imagesize = "0.13"

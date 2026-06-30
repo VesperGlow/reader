@@ -10,9 +10,9 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
+use ego_tree::NodeRef;
 use percent_encoding::percent_decode_str;
 use regex::Regex;
-use scraper::ego_tree::NodeRef;
 use scraper::node::Element;
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;

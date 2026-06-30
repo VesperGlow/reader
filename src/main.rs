@@ -629,7 +629,7 @@ async fn book_asset(State(state): State<AppState>, headers: HeaderMap, AxumPath(
     let mut entries = fs::read_dir(&dir).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "资源不存在".into()))?;
     let mut found: Option<PathBuf> = None;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+        if entry.file_name().to_string_lossy().starts_with(prefix.as_str()) {
             found = Some(entry.path());
             break;
         }
