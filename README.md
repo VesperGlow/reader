@@ -35,7 +35,7 @@ docker exec -it reader rust-reader create-admin
 
 ## 本地启动
 
-需要 Rust 1.85 或更新版本：
+需要 Rust 1.85+（edition 2024）；CI 与容器镜像使用 Rust 1.88 构建，建议本地不低于该版本（EPUB 解析依赖 `scraper`/`html5ever` 等较新 crate）。
 
 ```bash
 cargo run --release
@@ -50,7 +50,7 @@ READER_ADDR=0.0.0.0:8080 READER_DATA_DIR=/path/to/data cargo run --release
 ```
 
 - `READER_ADDR`：监听地址，默认 `127.0.0.1:3000`。
-- `READER_DATA_DIR`：数据目录（数据库与书籍），默认 `./data`。
+- `READER_DATA_DIR`：数据目录，默认 `./data`。含 `reader.db`（数据库）、`books/`（原始书籍文件）与 `derived/<book_id>/`（EPUB 解析产物：正文、封面、图片）。
 - `READER_SECURE_COOKIE`：设为 `1`/`true` 时强制给会话 Cookie 加 `Secure`。默认会按反代透传的 `X-Forwarded-Proto: https` 自动判断；若反代没有透传该头，HTTPS 部署下请显式设为 `1`。
 
 ## 容器部署
