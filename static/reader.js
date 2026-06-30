@@ -6,8 +6,6 @@
 window.ReaderApp = (function () {
   'use strict';
 
-  const BLOCK_TAGS = new Set(['P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'BLOCKQUOTE', 'PRE', 'FIGURE', 'IMG', 'SVG', 'TABLE', 'HR']);
-  const READER_CACHE_VERSION = window.readerCache?.CACHE_VERSION || 1;
   const RUNTIME_LIMIT = 2;
   const MAX_COLUMN = 720; // 桌面宽屏时限制单栏文字宽度，保证可读性
 
@@ -24,7 +22,7 @@ window.ReaderApp = (function () {
   const PROGRESS_SAVE_DELAY = 1200; // 翻页停下这么久后才真正写一次，合并快速翻页的连续写入
   let resizeTimer = null;
 
-  // state: { bookId, info, kind, contentNode, toc, tocEntries, assetUrls,
+  // state: { bookId, info, kind, contentNode, toc, tocEntries,
   //          currentPage, pageCount, pageWidth, pageHeight, restoreRatio }
 
   function init(rootElement) {
@@ -150,17 +148,9 @@ window.ReaderApp = (function () {
 
   function destroyBook(bookId) {
     bookId = String(bookId);
-    const state = runtime.get(bookId);
-    if (state) {
-      releaseAssets(state);
-      runtime.delete(bookId);
-    }
+    runtime.delete(bookId);
     const index = order.indexOf(bookId);
     if (index !== -1) order.splice(index, 1);
-  }
-
-  function releaseAssets(state) {
-    if (state?.assetUrls) for (const url of state.assetUrls.values()) URL.revokeObjectURL(url);
   }
 
   // ---- 打开书籍 ----
@@ -225,18 +215,17 @@ window.ReaderApp = (function () {
     const info = options.book || await fetchBookInfo(bookId);
     if (!info) throw new Error('书籍不存在');
     setHeader(info);
-    console.time('restore progress');
     const savedProgress = api(`/api/books/${bookId}/progress`)
       .then(response => response.json())
-      .catch(() => ({ page: 0, total_pages: null }))
-      .finally(() => console.timeEnd('restore progress'));
+      .catch(() => ({ page: 0, total_pages: null }));
 
     setLoading('正在读取书籍…');
-    const model = await loadBookSource(bookId, info);
+    // 解析已在服务端完成：EPUB 返回清洗好的正文 HTML + 目录，TXT 返回原文 + 目录偏移。
+    const model = await fetchContent(bookId);
     const contentNode = assembleContent(model);
     const state = {
       bookId, info, kind: info.kind, contentNode,
-      toc: model.toc || [], tocEntries: [], assetUrls: model.assetUrls || null,
+      toc: model.toc || [], tocEntries: [],
       currentPage: 0, pageCount: 1, pageWidth: 0, pageHeight: 0, restoreRatio: 0,
     };
     const progress = await savedProgress;
@@ -250,24 +239,25 @@ window.ReaderApp = (function () {
     if (model.kind === 'txt') {
       const node = document.createElement('div');
       node.className = 'book-content txt';
+      const text = model.text || '';
       const toc = (model.toc || []).map((entry, index) => ({ offset: Number(entry.offset) || 0, index }))
         .sort((a, b) => a.offset - b.offset);
       let pos = 0;
       for (const { offset, index } of toc) {
-        const at = Math.max(pos, Math.min(model.text.length, offset));
-        if (at > pos) node.appendChild(document.createTextNode(model.text.slice(pos, at)));
+        const at = Math.max(pos, Math.min(text.length, offset));
+        if (at > pos) node.appendChild(document.createTextNode(text.slice(pos, at)));
         const anchor = document.createElement('span');
         anchor.className = 'toc-anchor';
         anchor.dataset.toc = String(index);
         node.appendChild(anchor);
         pos = at;
       }
-      node.appendChild(document.createTextNode(model.text.slice(pos)));
+      node.appendChild(document.createTextNode(text.slice(pos)));
       return node;
     }
     const node = document.createElement('div');
     node.className = 'book-content epub';
-    for (const block of model.blocks) node.appendChild(block);
+    node.innerHTML = model.html || '';
     return node;
   }
 
@@ -276,392 +266,9 @@ window.ReaderApp = (function () {
     return books.find(book => String(book.id) === String(bookId)) || null;
   }
 
-  async function loadBookSource(bookId, info) {
-    const cached = await readBookCache(bookId, info);
-    if (cached) {
-      console.info('[reader cache] file hit', { bookId });
-      try {
-        const result = await buildSourceModel(bookId, cached.file, info, cached.metadata);
-        if (!metadataMatches(cached.metadata, info.kind, info.updated_at)) void writeBookCache(bookId, info, cached.file, result.metadata);
-        return result.model;
-      } catch (error) {
-        console.warn('[reader cache] cached file failed, falling back to network', error);
-        await removeBookCache(bookId);
-      }
-    } else {
-      console.info('[reader cache] miss', { bookId });
-    }
-
-    const file = await fetchBookFile(bookId);
-    const result = await buildSourceModel(bookId, file, info, null);
-    void writeBookCache(bookId, info, file, result.metadata);
-    return result.model;
-  }
-
-  async function readBookCache(bookId, info) {
-    if (!window.readerCache) return null;
-    console.time('cache lookup');
-    try {
-      return await window.readerCache.get(bookId, info);
-    } catch (error) {
-      console.warn('[reader cache] read failed, falling back to network', error);
-      return null;
-    } finally {
-      console.timeEnd('cache lookup');
-    }
-  }
-
-  async function writeBookCache(bookId, info, file, metadata) {
-    if (!window.readerCache) return;
-    try {
-      await window.readerCache.put(bookId, info, file, metadata);
-      console.info('[reader cache] stored', { bookId });
-    } catch (error) {
-      console.warn('[reader cache] write failed', error);
-    }
-  }
-
-  async function removeBookCache(bookId) {
-    if (!window.readerCache) return;
-    try { await window.readerCache.remove(bookId); } catch (error) { console.warn('[reader cache] remove failed', error); }
-  }
-
-  async function fetchBookFile(bookId) {
-    console.time('fetch book');
-    try {
-      const response = await api(`/api/books/${bookId}/file`);
-      return await response.blob();
-    } finally {
-      console.timeEnd('fetch book');
-    }
-  }
-
-  async function buildSourceModel(bookId, file, info, metadata) {
-    if (info.kind === 'txt') {
-      const text = file instanceof Blob ? await file.text() : new TextDecoder().decode(file);
-      console.time('parse toc');
-      let toc;
-      try {
-        toc = metadataMatches(metadata, 'txt', info.updated_at) ? metadata.toc : extractTextToc(text);
-      } finally {
-        console.timeEnd('parse toc');
-      }
-      if (metadataMatches(metadata, 'txt', info.updated_at)) console.info('[reader cache] metadata hit', { bookId });
-      return {
-        model: { kind: 'txt', text, toc },
-        metadata: { opfPath: null, manifest: [], spine: [], toc, cover: null, updatedAt: Number(info.updated_at), cacheVersion: READER_CACHE_VERSION },
-      };
-    }
-
-    if (!window.JSZip) throw new Error('JSZip 组件加载失败');
-    console.time('read arrayBuffer');
-    let buffer;
-    try {
-      buffer = file instanceof Blob ? await file.arrayBuffer() : file;
-    } finally {
-      console.timeEnd('read arrayBuffer');
-    }
-    return parseEpub(bookId, buffer, metadataMatches(metadata, 'epub', info.updated_at) ? metadata : null, info.updated_at);
-  }
-
-  function metadataMatches(metadata, kind, updatedAt) {
-    if (!metadata || metadata.cacheVersion !== READER_CACHE_VERSION || metadata.updatedAt !== Number(updatedAt) || !Array.isArray(metadata.toc)) return false;
-    if (kind === 'txt') return true;
-    return typeof metadata.opfPath === 'string' && Array.isArray(metadata.manifest) && Array.isArray(metadata.spine);
-  }
-
-  async function parseEpub(bookId, buffer, cachedMetadata = null, updatedAt = 0) {
-    setLoading('正在解析 EPUB…');
-    console.time('zip load');
-    let zip;
-    try {
-      zip = await JSZip.loadAsync(buffer);
-    } finally {
-      console.timeEnd('zip load');
-    }
-
-    let opfPath;
-    let manifest;
-    let spineIds;
-    let toc;
-    let cover;
-    let opfDoc = null;
-    console.time('parse opf');
-    try {
-      if (cachedMetadata) {
-        opfPath = cachedMetadata.opfPath;
-        manifest = new Map(cachedMetadata.manifest.map(([id, item]) => [id, { ...item }]));
-        spineIds = cachedMetadata.spine.slice();
-        cover = cachedMetadata.cover || null;
-        console.info('[reader cache] metadata hit', { bookId });
-      } else {
-        const containerText = await requiredZipText(zip, 'META-INF/container.xml');
-        const containerDoc = parseXml(containerText);
-        const rootfile = localElements(containerDoc, 'rootfile')[0];
-        if (!rootfile) throw new Error('EPUB 缺少 container rootfile');
-        opfPath = normalizePath(rootfile.getAttribute('full-path'));
-        opfDoc = parseXml(await requiredZipText(zip, opfPath));
-        manifest = new Map();
-        for (const item of localElements(opfDoc, 'item')) {
-          const path = resolvePath(opfPath, item.getAttribute('href') || '');
-          const record = { path, mediaType: item.getAttribute('media-type') || '', properties: item.getAttribute('properties') || '' };
-          manifest.set(item.getAttribute('id'), record);
-        }
-        spineIds = localElements(opfDoc, 'itemref').map(item => item.getAttribute('idref')).filter(Boolean);
-        cover = extractCoverInfo(opfDoc, manifest);
-      }
-    } finally {
-      console.timeEnd('parse opf');
-    }
-
-    const mimeByPath = new Map();
-    for (const item of manifest.values()) mimeByPath.set(item.path, item.mediaType);
-    console.time('parse toc');
-    try {
-      toc = opfDoc
-        ? await extractEpubToc(zip, opfPath, opfDoc, manifest)
-        : cachedMetadata.toc.slice();
-    } finally {
-      console.timeEnd('parse toc');
-    }
-    const assetUrls = new Map();
-    const blocks = [];
-
-    console.time('render chapter');
-    try {
-      for (let index = 0; index < spineIds.length; index++) {
-        const item = manifest.get(spineIds[index]);
-        if (!item || !/xhtml|html|xml/i.test(item.mediaType)) continue;
-        setLoading(`正在解析章节 ${index + 1} / ${spineIds.length}…`);
-        const chapter = new DOMParser().parseFromString(await requiredZipText(zip, item.path), 'text/html');
-        sanitizeDocument(chapter);
-        await localizeAssets(chapter, item.path, zip, mimeByPath, assetUrls);
-        const chapterBlocks = collectReadableBlocks(chapter.body);
-        chapterBlocks.forEach(block => block.dataset.sourcePath = item.path);
-        blocks.push(...chapterBlocks);
-        await nextFrame();
-      }
-    } finally {
-      console.timeEnd('render chapter');
-    }
-    if (!blocks.length) throw new Error('EPUB 中没有可阅读内容');
-    return {
-      model: { kind: 'epub', blocks, assetUrls, toc },
-      metadata: {
-        opfPath,
-        manifest: Array.from(manifest.entries()),
-        spine: spineIds,
-        toc,
-        cover,
-        updatedAt: Number(updatedAt),
-        cacheVersion: READER_CACHE_VERSION,
-      },
-    };
-  }
-
-  function extractCoverInfo(opfDoc, manifest) {
-    const coverId = localElements(opfDoc, 'meta').find(meta => meta.getAttribute('name') === 'cover')?.getAttribute('content');
-    let entry = coverId && manifest.has(coverId) ? [coverId, manifest.get(coverId)] : null;
-    if (!entry) entry = Array.from(manifest.entries()).find(([, item]) => (item.properties || '').split(/\s+/).includes('cover-image'));
-    if (!entry) entry = Array.from(manifest.entries()).find(([, item]) => /(^|[/_.-])cover([/_.-]|$)/i.test(item.path) && /^image\//.test(item.mediaType));
-    return entry ? { id: entry[0], path: entry[1].path, mediaType: entry[1].mediaType } : null;
-  }
-
-  async function extractEpubToc(zip, opfPath, opfDoc, manifest) {
-    const items = Array.from(manifest.values());
-    const navItem = items.find(item => /(^|\s)nav(\s|$)/.test(item.properties || ''));
-    if (navItem) {
-      const navDoc = new DOMParser().parseFromString(await requiredZipText(zip, navItem.path), 'text/html');
-      const navs = Array.from(navDoc.querySelectorAll('nav'));
-      const nav = navs.find(element => element.getAttribute('epub:type') === 'toc' || element.getAttribute('type') === 'toc') || navs[0];
-      if (nav) {
-        const entries = Array.from(nav.querySelectorAll('a[href]')).map(anchor => {
-          const href = anchor.getAttribute('href');
-          const hash = href.includes('#') ? decodePath(href.split('#').slice(1).join('#')) : '';
-          return { label: anchor.textContent.trim(), path: resolvePath(navItem.path, href), fragment: hash, depth: tocDepth(anchor) };
-        }).filter(entry => entry.label);
-        if (entries.length) return entries;
-      }
-    }
-    const ncxId = localElements(opfDoc, 'spine')[0]?.getAttribute('toc');
-    const ncxItem = manifest.get(ncxId) || items.find(item => /ncx/i.test(item.mediaType));
-    if (!ncxItem) return [];
-    const ncxDoc = parseXml(await requiredZipText(zip, ncxItem.path));
-    return localElements(ncxDoc, 'navPoint').map(point => {
-      const content = localElements(point, 'content')[0];
-      const src = content?.getAttribute('src') || '';
-      const hash = src.includes('#') ? decodePath(src.split('#').slice(1).join('#')) : '';
-      return { label: localElements(point, 'text')[0]?.textContent.trim() || '未命名章节', path: resolvePath(ncxItem.path, src), fragment: hash, depth: ancestorDepth(point, 'navPoint') };
-    });
-  }
-
-  function tocDepth(anchor) {
-    let depth = 0;
-    for (let node = anchor.parentElement; node; node = node.parentElement) if (node.tagName === 'OL' || node.tagName === 'UL') depth++;
-    return Math.max(0, depth - 1);
-  }
-
-  function ancestorDepth(element, localName) {
-    let depth = 0;
-    for (let node = element.parentElement; node; node = node.parentElement) if (node.localName === localName) depth++;
-    return depth;
-  }
-
-  function extractTextToc(text) {
-    const entries = [];
-    const pattern = /^(?:\s{0,4})(第[零〇一二三四五六七八九十百千万两\d]+[章节卷部回篇][^\n]{0,40}|(?:chapter|part)\s+[\divxlcdm]+[^\n]{0,40})\s*$/gim;
-    for (const match of text.matchAll(pattern)) entries.push({ label: match[1].trim(), offset: match.index, depth: 0 });
-    return entries.slice(0, 500);
-  }
-
-  function collectReadableBlocks(rootNode) {
-    const blocks = [];
-    // 收集时会丢掉包裹用的 <div id>/空 <a id> 锚点，但目录的 #fragment 往往就指向它们。
-    // 把这些待定的锚点 id 顺延到紧随其后的第一个可读块上，保证目录能定位到正文。
-    let pendingIds = [];
-    const pushBlock = block => {
-      if (pendingIds.length) {
-        const existing = block.dataset.fragIds ? block.dataset.fragIds + ' ' : '';
-        block.dataset.fragIds = existing + pendingIds.join(' ');
-        pendingIds = [];
-      }
-      blocks.push(block);
-    };
-    const walk = parent => {
-      for (const child of parent.childNodes) {
-        if (child.nodeType === Node.TEXT_NODE) {
-          if (child.textContent.trim()) {
-            const paragraph = document.createElement('p');
-            paragraph.textContent = child.textContent;
-            pushBlock(paragraph);
-          }
-          continue;
-        }
-        if (child.nodeType !== Node.ELEMENT_NODE) continue;
-        const childId = child.getAttribute('id');
-        if (BLOCK_TAGS.has(child.tagName)) {
-          // 丢弃空段落/空标题（EPUB 常用它们撑排版，会让排版忽松忽紧）。
-          if (child.tagName === 'HR' || child.tagName === 'IMG' || child.tagName === 'SVG'
-              || child.textContent.trim() || child.querySelector('img,svg,image')) {
-            pushBlock(child.cloneNode(true));
-          } else if (childId) {
-            pendingIds.push(childId);
-          }
-        } else if (hasBlockDescendant(child)) {
-          if (childId) pendingIds.push(childId);
-          walk(child);
-        } else if (child.textContent.trim() || child.querySelector('img,svg')) {
-          pushBlock(child.cloneNode(true));
-        } else if (childId) {
-          pendingIds.push(childId);
-        }
-      }
-    };
-    walk(rootNode);
-    return blocks;
-  }
-
-  function hasBlockDescendant(element) {
-    return Array.from(element.querySelectorAll('*')).some(child => BLOCK_TAGS.has(child.tagName));
-  }
-
-  function sanitizeDocument(doc) {
-    doc.querySelectorAll('script,iframe,object,embed,form,input,button,meta,base').forEach(node => node.remove());
-    doc.querySelectorAll('*').forEach(element => {
-      for (const attribute of Array.from(element.attributes)) {
-        if (/^on/i.test(attribute.name)) element.removeAttribute(attribute.name);
-      }
-      // 链接里的危险协议清掉：javascript:/vbscript: 一律去；data: 仅 SVG <image> 放行（图片走 src）。
-      const tag = element.localName;
-      for (const attribute of ['href', 'xlink:href']) {
-        const value = element.getAttribute(attribute);
-        if (!value) continue;
-        if (/^\s*(?:javascript|vbscript):/i.test(value)) { element.removeAttribute(attribute); continue; }
-        if (/^\s*data:/i.test(value) && tag !== 'image') element.removeAttribute(attribute);
-      }
-      // 去掉书内自带的内联排版，统一交给阅读器样式，避免间距/字号忽大忽小。
-      element.removeAttribute('style');
-      element.removeAttribute('align');
-    });
-    doc.querySelectorAll('style,link[rel="stylesheet"]').forEach(node => node.remove());
-    // Calibre 等导出器把整页封面写成 <svg viewBox><image/></svg>。内联 SVG 里的位图
-    // 在合成层(.book-content will-change:transform)里常被按固有尺寸栅格化后再放大，
-    // 封面因此发虚/马赛克；这里把“只裹一张图”的 SVG 拆成等价 <img>，走普通图片渲染
-    // 路径——既清晰，又能复用 localizeAssets 里的 decode + 写回宽高预留版位逻辑。
-    doc.querySelectorAll('svg').forEach(svg => {
-      const inner = svg.querySelectorAll('*');
-      if (inner.length !== 1 || inner[0].localName !== 'image') return;
-      const href = inner[0].getAttribute('href') || inner[0].getAttribute('xlink:href');
-      if (!href) return;
-      const img = doc.createElement('img');
-      img.setAttribute('src', href);
-      const alt = svg.getAttribute('aria-label') || inner[0].getAttribute('alt') || '';
-      if (alt) img.setAttribute('alt', alt);
-      svg.replaceWith(img);
-    });
-  }
-
-  async function localizeAssets(doc, chapterPath, zip, mimeByPath, cache) {
-    const elements = Array.from(doc.querySelectorAll('[src],image[href],image[xlink\\:href]'));
-    await Promise.all(elements.map(async element => {
-      const attribute = element.hasAttribute('src') ? 'src' : element.hasAttribute('href') ? 'href' : 'xlink:href';
-      const value = element.getAttribute(attribute);
-      if (!value || /^(data:|blob:|https?:)/i.test(value)) return;
-      const path = resolvePath(chapterPath, value);
-      const file = zip.file(path);
-      if (!file) return;
-      if (!cache.has(path)) {
-        const blob = await file.async('blob');
-        cache.set(path, URL.createObjectURL(new Blob([blob], { type: mimeByPath.get(path) || blob.type || 'application/octet-stream' })));
-      }
-      element.setAttribute(attribute, cache.get(path));
-      element.removeAttribute('srcset');
-      if (element.tagName === 'IMG' && typeof element.decode === 'function') {
-        try { await element.decode(); } catch (_) {}
-        // 把图片固有宽高写回属性：克隆到正文后浏览器无需等像素加载即可按宽高比预留版位，
-        // 避免图片迟到引发重排——否则分栏页码会算在图片真正落位之前（手机端尤甚）。
-        if (element.naturalWidth && element.naturalHeight && !element.hasAttribute('width') && !element.hasAttribute('height')) {
-          element.setAttribute('width', element.naturalWidth);
-          element.setAttribute('height', element.naturalHeight);
-        }
-      }
-    }));
-  }
-
-  function parseXml(text) {
-    const doc = new DOMParser().parseFromString(text, 'application/xml');
-    if (doc.querySelector('parsererror')) throw new Error('EPUB XML 格式无效');
-    return doc;
-  }
-
-  function localElements(doc, name) {
-    return Array.from(doc.getElementsByTagName('*')).filter(element => element.localName === name);
-  }
-
-  async function requiredZipText(zip, path) {
-    const file = zip.file(normalizePath(path));
-    if (!file) throw new Error(`EPUB 缺少文件：${path}`);
-    return file.async('string');
-  }
-
-  function resolvePath(baseFile, relative) {
-    const clean = decodePath(String(relative).split('#')[0].split('?')[0]);
-    if (!clean) return normalizePath(baseFile);
-    const base = clean.startsWith('/') ? [] : normalizePath(baseFile).split('/').slice(0, -1);
-    return normalizePath([...base, ...clean.split('/')].join('/'));
-  }
-
-  function normalizePath(path) {
-    const parts = [];
-    for (const part of String(path || '').replace(/^\//, '').split('/')) {
-      if (!part || part === '.') continue;
-      if (part === '..') parts.pop(); else parts.push(part);
-    }
-    return parts.join('/');
-  }
-
-  function decodePath(path) {
-    try { return decodeURIComponent(path); } catch (_) { return path; }
+  async function fetchContent(bookId) {
+    const response = await api(`/api/books/${bookId}/content`);
+    return await response.json();
   }
 
   // ---- 分栏布局 / 翻页 ----

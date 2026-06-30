@@ -20,16 +20,16 @@ use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::TcpListener, 
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
+mod epub;
+
 type DbPool = r2d2::Pool<SqliteConnectionManager>;
 
 const INDEX_HTML: &str = include_str!("../static/index.html");
 const READER_HTML: &str = include_str!("../static/reader.html");
 const APP_CSS: &str = include_str!("../static/app.css");
 const APP_JS: &str = include_str!("../static/app.js");
-const READER_CACHE_JS: &str = include_str!("../static/reader-cache.js");
 const READER_JS: &str = include_str!("../static/reader.js");
 const ROUTER_JS: &str = include_str!("../static/router.js");
-const JSZIP_JS: &str = include_str!("../static/vendor/jszip.min.js");
 const MAX_BOOK_SIZE: usize = 64 * 1024 * 1024;
 const SESSION_SECONDS: i64 = 30 * 24 * 60 * 60;
 // 登录限速：单一来源在窗口内最多尝试次数，超出后返回 429（同时挡住对 Argon2 的 CPU 放大攻击）。
@@ -45,6 +45,10 @@ const SECURITY_HEADER_CSP: &str = "default-src 'self'; script-src 'self'; style-
 struct AppState {
     db: DbPool,
     books_dir: Arc<PathBuf>,
+    // 解析产物目录（每本书一个子目录 <id>/：content.html、cover.*、assets/*）。
+    derived_dir: Arc<PathBuf>,
+    // 串行化 EPUB 解析（懒迁移旧书时避免并发重复解析同一本）。
+    parse_lock: Arc<tokio::sync::Mutex<()>>,
     login_attempts: Arc<std::sync::Mutex<HashMap<String, LoginAttempt>>>,
     // 用户名不存在时拿它跑一次等价的 Argon2 校验，抹平时序，避免用户名枚举。
     dummy_hash: Arc<String>,
@@ -100,6 +104,8 @@ struct Book {
     series_index: Option<f64>,
     updated_at: i64,
     reading_progress: Option<i64>,
+    // None=尚未解析（旧书，首次访问封面/正文时懒解析）；Some(true/false)=已知有无内嵌封面。
+    has_cover: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -140,7 +146,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = std::env::var("READER_DATA_DIR").unwrap_or_else(|_| "data".into());
     let data_dir = PathBuf::from(data_dir);
     let books_dir = data_dir.join("books");
+    let derived_dir = data_dir.join("derived");
     fs::create_dir_all(&books_dir).await?;
+    fs::create_dir_all(&derived_dir).await?;
 
     // 先用单连接建表/迁移（WAL 是持久化到库文件的，对后续所有连接生效），随后切到连接池。
     drop(open_database(&data_dir)?);
@@ -160,6 +168,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         db: pool,
         books_dir: Arc::new(books_dir),
+        derived_dir: Arc::new(derived_dir),
+        parse_lock: Arc::new(tokio::sync::Mutex::new(())),
         login_attempts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         dummy_hash: Arc::new(dummy_hash),
         force_secure_cookie,
@@ -170,10 +180,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/reader", get(reader_page))
         .route("/app.css", get(css))
         .route("/app.js", get(app_js))
-        .route("/reader-cache.js", get(reader_cache_js))
         .route("/reader.js", get(reader_js))
         .route("/router.js", get(router_js))
-        .route("/vendor/jszip.min.js", get(jszip_js))
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/me", get(me))
@@ -181,6 +189,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/books", get(list_books).post(upload_book))
         .route("/api/books/{id}", delete(delete_book).patch(update_book))
         .route("/api/books/{id}/file", get(book_file))
+        .route("/api/books/{id}/content", get(book_content))
+        .route("/api/books/{id}/cover", get(book_cover))
+        .route("/api/books/{id}/asset/{idx}", get(book_asset))
         .route("/api/books/{id}/progress", get(get_progress).put(save_progress))
         .fallback(spa_fallback)
         .layer(DefaultBodyLimit::max(MAX_BOOK_SIZE + 1024 * 1024))
@@ -209,10 +220,8 @@ async fn index() -> Html<&'static str> { Html(INDEX_HTML) }
 async fn reader_page() -> Html<&'static str> { Html(READER_HTML) }
 async fn css() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], APP_CSS) }
 async fn app_js() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], APP_JS) }
-async fn reader_cache_js() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], READER_CACHE_JS) }
 async fn reader_js() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], READER_JS) }
 async fn router_js() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], ROUTER_JS) }
-async fn jszip_js() -> impl IntoResponse { ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=31536000, immutable")], JSZIP_JS) }
 
 // SPA fallback：未匹配的 /api/* 返回 404 JSON（不被吞掉），其余路径返回 index.html。
 async fn spa_fallback(uri: Uri) -> Response {
@@ -308,6 +317,12 @@ async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> AppRes
                     WHEN reading_progress.total_pages = 1 THEN 100
                     WHEN reading_progress.total_pages > 1 THEN CAST(MIN(100, MAX(0, ROUND(100.0 * reading_progress.page / (reading_progress.total_pages - 1)))) AS INTEGER)
                     ELSE 0
+                END,
+                CASE
+                    WHEN books.kind = 'txt' THEN 0
+                    WHEN books.parsed_at IS NULL THEN NULL
+                    WHEN books.cover_ext IS NOT NULL THEN 1
+                    ELSE 0
                 END
          FROM books
          LEFT JOIN reading_progress ON reading_progress.book_id = books.id AND reading_progress.user_id = books.user_id
@@ -327,6 +342,7 @@ async fn list_books(State(state): State<AppState>, headers: HeaderMap) -> AppRes
             series_index: row.get(7)?,
             updated_at: row.get(8)?,
             reading_progress: row.get(9)?,
+            has_cover: row.get::<_, Option<i64>>(10)?.map(|value| value != 0),
         })
     })
         .map_err(|_| AppError::internal("读取书架失败"))?;
@@ -406,30 +422,228 @@ async fn upload_book(State(state): State<AppState>, headers: HeaderMap, mut mult
     };
     let title = Path::new(&original_name).file_stem().and_then(|value| value.to_str()).unwrap_or("未命名").trim().to_string();
     let created_at = now();
-    let insert_result = {
+    let book_id = {
         let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
-        db.execute("INSERT INTO books(user_id, title, kind, stored_name, size, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)", params![user_id, title, extension, stored_name, size, created_at])
-            .map(|_| Book {
-                id: db.last_insert_rowid(),
-                title,
-                kind: extension,
-                size,
-                created_at,
-                author: None,
-                series_name: None,
-                series_index: None,
-                updated_at: created_at,
-                reading_progress: None,
-            })
-    };
-    let result = match insert_result {
-        Ok(book) => book,
-        Err(_) => {
-            let _ = fs::remove_file(&path).await;
-            return Err(AppError::internal("保存书籍记录失败"));
+        match db.execute(
+            "INSERT INTO books(user_id, title, kind, stored_name, size, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            params![user_id, title, extension, stored_name, size, created_at],
+        ) {
+            Ok(_) => db.last_insert_rowid(),
+            Err(_) => {
+                let _ = fs::remove_file(&path).await;
+                return Err(AppError::internal("保存书籍记录失败"));
+            }
         }
     };
-    Ok(Json(result))
+
+    let mut book = Book {
+        id: book_id,
+        title,
+        kind: extension.clone(),
+        size,
+        created_at,
+        author: None,
+        series_name: None,
+        series_index: None,
+        updated_at: created_at,
+        reading_progress: None,
+        has_cover: Some(false),
+    };
+
+    // EPUB 上传即在服务端解析：封面/目录/作者系列入库、正文与图片落盘到 derived/<id>/。
+    // 解析失败＝这本书无法阅读，整笔回滚（删文件、删 derived、删记录）并报错，让问题立即暴露。
+    if extension == "epub" {
+        match parse_book(&state, book_id, &stored_name).await {
+            Ok(parsed) => {
+                let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+                if db.execute(
+                    "UPDATE books SET author = ?1, series_name = ?2, series_index = ?3, cover_ext = ?4, toc_json = ?5, parsed_at = ?6 WHERE id = ?7",
+                    params![parsed.author, parsed.series_name, parsed.series_index, parsed.cover_ext, parsed.toc_json, now(), book_id],
+                ).is_err() {
+                    return Err(AppError::internal("保存解析结果失败"));
+                }
+                book.has_cover = Some(parsed.cover_ext.is_some());
+                book.author = parsed.author;
+                book.series_name = parsed.series_name;
+                book.series_index = parsed.series_index;
+            }
+            Err(message) => {
+                let _ = fs::remove_file(&path).await;
+                let _ = fs::remove_dir_all(state.derived_dir.join(book_id.to_string())).await;
+                if let Ok(db) = state.db.get() {
+                    let _ = db.execute("DELETE FROM books WHERE id = ?1", params![book_id]);
+                }
+                return Err(AppError::bad_request(message));
+            }
+        }
+    }
+
+    Ok(Json(book))
+}
+
+// 在阻塞线程里解析 EPUB（zip/HTML 解析是同步且 CPU 密集，不放进 async 执行器）。
+async fn parse_book(state: &AppState, book_id: i64, stored_name: &str) -> Result<epub::ParsedEpub, String> {
+    let epub_path = state.books_dir.join(stored_name);
+    let derived = state.derived_dir.join(book_id.to_string());
+    tokio::task::spawn_blocking(move || epub::parse_epub(&epub_path, &derived, book_id))
+        .await
+        .map_err(|_| "解析任务失败".to_string())?
+}
+
+// 旧书懒迁移：parsed_at 为空的 EPUB 在首次访问封面/正文时解析一次。用全局锁串行化，避免并发重复解析。
+async fn ensure_parsed(state: &AppState, book_id: i64, kind: &str, stored_name: &str, parsed_at: Option<i64>) -> AppResult<()> {
+    if kind != "epub" || parsed_at.is_some() {
+        return Ok(());
+    }
+    let _guard = state.parse_lock.lock().await;
+    let already = {
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.query_row("SELECT parsed_at FROM books WHERE id = ?1", params![book_id], |row| row.get::<_, Option<i64>>(0))
+            .optional().map_err(|_| AppError::internal("读取书籍失败"))?.flatten()
+    };
+    if already.is_some() {
+        return Ok(());
+    }
+    let parsed = parse_book(state, book_id, stored_name).await.map_err(AppError::internal)?;
+    let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+    // 旧书可能已通过早期前端流程填过 author/series，用 COALESCE 不覆盖已有值。
+    db.execute(
+        "UPDATE books SET author = COALESCE(author, ?1), series_name = COALESCE(series_name, ?2), series_index = COALESCE(series_index, ?3), cover_ext = ?4, toc_json = ?5, parsed_at = ?6 WHERE id = ?7",
+        params![parsed.author, parsed.series_name, parsed.series_index, parsed.cover_ext, parsed.toc_json, now(), book_id],
+    ).map_err(|_| AppError::internal("保存解析结果失败"))?;
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ContentResponse {
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    toc: Box<serde_json::value::RawValue>,
+}
+
+// 阅读正文：EPUB 返回服务端清洗好的 HTML + 目录；TXT 解压回原文并即时算目录。
+async fn book_content(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Response> {
+    let (user_id, _) = authenticated_user(&state, &headers).await?;
+    let record = {
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.query_row(
+            "SELECT kind, stored_name, parsed_at, toc_json FROM books WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)),
+        ).optional().map_err(|_| AppError::internal("读取书籍失败"))?
+    }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
+    let (kind, stored_name, parsed_at, toc_json) = record;
+
+    if kind == "epub" {
+        ensure_parsed(&state, id, &kind, &stored_name, parsed_at).await?;
+        // 懒解析后目录才写进库，重新取一次。
+        let toc_json = if parsed_at.is_some() {
+            toc_json
+        } else {
+            let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+            db.query_row("SELECT toc_json FROM books WHERE id = ?1", params![id], |row| row.get::<_, Option<String>>(0))
+                .optional().map_err(|_| AppError::internal("读取书籍失败"))?.flatten()
+        };
+        let html = fs::read_to_string(state.derived_dir.join(id.to_string()).join("content.html")).await
+            .map_err(|_| AppError::internal("正文不存在，请重新上传该书"))?;
+        return content_response("epub", Some(html), None, toc_json);
+    }
+
+    let text = read_txt_text(&state, &stored_name).await?;
+    let toc = epub::extract_txt_toc(&text);
+    content_response("txt", None, Some(text), Some(toc))
+}
+
+fn content_response(kind: &str, html: Option<String>, text: Option<String>, toc_json: Option<String>) -> AppResult<Response> {
+    let toc = serde_json::value::RawValue::from_string(toc_json.unwrap_or_else(|| "[]".into()))
+        .unwrap_or_else(|_| serde_json::value::RawValue::from_string("[]".into()).unwrap());
+    Ok(Json(ContentResponse { kind: kind.to_string(), html, text, toc }).into_response())
+}
+
+// 解压（或直读旧的未压缩）TXT 为字符串。
+async fn read_txt_text(state: &AppState, stored_name: &str) -> AppResult<String> {
+    let file = fs::File::open(state.books_dir.join(stored_name)).await
+        .map_err(|_| AppError(StatusCode::NOT_FOUND, "书籍文件不存在".into()))?;
+    let mut text = String::new();
+    if stored_name.ends_with(".zst") {
+        ZstdDecoder::new(BufReader::new(file)).read_to_string(&mut text).await
+            .map_err(|_| AppError::internal("读取书籍失败"))?;
+    } else {
+        BufReader::new(file).read_to_string(&mut text).await
+            .map_err(|_| AppError::internal("读取书籍失败"))?;
+    }
+    Ok(text)
+}
+
+// EPUB 内嵌封面（书架用）。TXT 或无封面返回 404，前端据此回退到色块。
+async fn book_cover(State(state): State<AppState>, headers: HeaderMap, AxumPath(id): AxumPath<i64>) -> AppResult<Response> {
+    let (user_id, _) = authenticated_user(&state, &headers).await?;
+    let record = {
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.query_row(
+            "SELECT kind, stored_name, parsed_at, cover_ext FROM books WHERE id = ?1 AND user_id = ?2",
+            params![id, user_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)),
+        ).optional().map_err(|_| AppError::internal("读取书籍失败"))?
+    }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
+    let (kind, stored_name, parsed_at, cover_ext) = record;
+    if kind != "epub" {
+        return Err(AppError(StatusCode::NOT_FOUND, "无封面".into()));
+    }
+    ensure_parsed(&state, id, &kind, &stored_name, parsed_at).await?;
+    let cover_ext = if parsed_at.is_some() {
+        cover_ext
+    } else {
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.query_row("SELECT cover_ext FROM books WHERE id = ?1", params![id], |row| row.get::<_, Option<String>>(0))
+            .optional().map_err(|_| AppError::internal("读取书籍失败"))?.flatten()
+    };
+    let ext = cover_ext.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "无封面".into()))?;
+    let path = state.derived_dir.join(id.to_string()).join(format!("cover.{ext}"));
+    let file = fs::File::open(&path).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "封面不存在".into()))?;
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, epub::asset_content_type(&ext))
+        .header(header::CACHE_CONTROL, "private, max-age=86400");
+    if let Ok(meta) = file.metadata().await {
+        builder = builder.header(header::CONTENT_LENGTH, meta.len());
+    }
+    builder.body(Body::from_stream(ReaderStream::new(file))).map_err(|_| AppError::internal("创建响应失败"))
+}
+
+// 正文里图片资源：derived/<id>/assets/<idx>.<ext>，扩展名通过目录前缀匹配。
+async fn book_asset(State(state): State<AppState>, headers: HeaderMap, AxumPath((id, idx)): AxumPath<(i64, u32)>) -> AppResult<Response> {
+    let (user_id, _) = authenticated_user(&state, &headers).await?;
+    let owns = {
+        let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+        db.query_row("SELECT 1 FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id], |_| Ok(()))
+            .optional().map_err(|_| AppError::internal("读取书籍失败"))?.is_some()
+    };
+    if !owns {
+        return Err(AppError(StatusCode::NOT_FOUND, "书籍不存在".into()));
+    }
+    let dir = state.derived_dir.join(id.to_string()).join("assets");
+    let prefix = format!("{idx}.");
+    let mut entries = fs::read_dir(&dir).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "资源不存在".into()))?;
+    let mut found: Option<PathBuf> = None;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            found = Some(entry.path());
+            break;
+        }
+    }
+    let path = found.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "资源不存在".into()))?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let file = fs::File::open(&path).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "资源不存在".into()))?;
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, epub::asset_content_type(ext))
+        .header(header::CACHE_CONTROL, "private, max-age=86400");
+    if let Ok(meta) = file.metadata().await {
+        builder = builder.header(header::CONTENT_LENGTH, meta.len());
+    }
+    builder.body(Body::from_stream(ReaderStream::new(file))).map_err(|_| AppError::internal("创建响应失败"))
 }
 
 async fn update_book(
@@ -520,6 +734,7 @@ async fn delete_book(State(state): State<AppState>, headers: HeaderMap, AxumPath
             .optional().map_err(|_| AppError::internal("删除书籍失败"))?
     }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
     let _ = fs::remove_file(state.books_dir.join(stored_name)).await;
+    let _ = fs::remove_dir_all(state.derived_dir.join(id.to_string())).await;
     let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
     db.execute("DELETE FROM books WHERE id = ?1 AND user_id = ?2", params![id, user_id]).map_err(|_| AppError::internal("删除书籍失败"))?;
     Ok(Json(ApiMessage { message: "已删除".into() }))
@@ -599,6 +814,11 @@ fn open_database(data_dir: &Path) -> Result<Connection, Box<dyn std::error::Erro
     ensure_column(&connection, "books", "series_name", "TEXT")?;
     ensure_column(&connection, "books", "series_index", "REAL")?;
     ensure_column(&connection, "books", "updated_at", "INTEGER")?;
+    // 服务端解析产物的状态：cover_ext=封面扩展名（无封面则 NULL）；toc_json=目录 JSON；
+    // parsed_at=解析时间（NULL=尚未解析，旧书首次访问时懒迁移）。
+    ensure_column(&connection, "books", "cover_ext", "TEXT")?;
+    ensure_column(&connection, "books", "toc_json", "TEXT")?;
+    ensure_column(&connection, "books", "parsed_at", "INTEGER")?;
     ensure_column(&connection, "reading_progress", "total_pages", "INTEGER")?;
     Ok(connection)
 }

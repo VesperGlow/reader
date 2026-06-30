@@ -8,14 +8,9 @@ window.Shelf = (function () {
   let allBooks = [];
   let activeFilter = 'all';
   let activeSeries = null;
-  let coverObserver;
-  let coverQueue = Promise.resolve();
   let managementMode = null;
   let suppressClick = 0;
   const selectedIds = new Set();
-  const coverUrls = new Set();
-  const coverBlobs = new Map();
-  const missingCovers = new Set();
 
   async function api(url, options = {}) {
     const response = await fetch(url, options);
@@ -88,7 +83,7 @@ window.Shelf = (function () {
     $('#shelf-title').textContent = activeSeries || shelfTitle();
     $('#books').innerHTML = items.map((item, index) => item.type === 'series' ? renderSeriesCard(item, index) : renderBookCard(item.book, index)).join('');
     bindRenderedCards();
-    observeCovers();
+    bindCoverImages();
   }
 
   function groupShelfBooks(books) {
@@ -145,7 +140,8 @@ window.Shelf = (function () {
   }
 
   function coverImage(book) {
-    return `<img class="embedded-cover" data-cover-id="${book.id}" data-created="${book.updated_at || book.created_at}" alt="" loading="lazy">`;
+    if (book.has_cover === false) return '';
+    return `<img class="embedded-cover" src="/api/books/${book.id}/cover" alt="" loading="lazy">`;
   }
 
   function bindRenderedCards() {
@@ -206,130 +202,24 @@ window.Shelf = (function () {
     for (const id of ids) {
       await api(`/api/books/${id}`, { method: 'DELETE' });
       window.ReaderApp?.destroyBook(id);
-      await clearCoverCache(id);
     }
   }
 
-  async function clearCoverCache(id) {
-    if (!('caches' in window)) return;
-    try {
-      const cache = await caches.open('reader-covers-v1');
-      for (const key of await cache.keys()) if (key.url.includes(`/cover-cache/${id}/`)) await cache.delete(key);
-    } catch (_) {}
-  }
-
-  function observeCovers() {
-    coverObserver?.disconnect();
-    coverObserver = new IntersectionObserver(entries => {
-      for (const entry of entries) if (entry.isIntersecting) {
-        coverObserver.unobserve(entry.target);
-        coverQueue = coverQueue.then(() => loadEmbeddedCover(entry.target)).catch(() => {});
-      }
-    }, { rootMargin: '180px' });
-    document.querySelectorAll('[data-cover-id]').forEach(image => coverObserver.observe(image));
-  }
-
-  async function loadEmbeddedCover(image) {
-    if (!window.JSZip || !image.isConnected) return;
-    const cacheKey = `/cover-cache/${image.dataset.coverId}/${image.dataset.created}`;
-    if (missingCovers.has(cacheKey)) return;
-    let blob = coverBlobs.get(cacheKey);
-    if ('caches' in window) {
-      try {
-        const cached = await (await caches.open('reader-covers-v1')).match(cacheKey);
-        if (cached?.status === 204) { missingCovers.add(cacheKey); return; }
-        if (cached) blob = await cached.blob();
-      } catch (_) {}
-    }
-    if (!blob) {
-      blob = await extractEpubCover(image.dataset.coverId);
-      if (!blob) {
-        missingCovers.add(cacheKey);
-        if ('caches' in window) try { await (await caches.open('reader-covers-v1')).put(cacheKey, new Response(null, { status: 204 })); } catch (_) {}
+  // 封面直接走服务端 /cover 接口：加载成功淡入，404（无封面）则移除图片露出底色占位。
+  // 用 JS 绑定 load/error（CSP 禁内联事件处理器，不能用 onload= 属性）。
+  function bindCoverImages() {
+    document.querySelectorAll('.embedded-cover').forEach(image => {
+      if (image.dataset.bound) return;
+      image.dataset.bound = '1';
+      if (image.complete) {
+        if (image.naturalWidth > 0) image.classList.add('loaded');
+        else image.remove();
         return;
       }
-      if ('caches' in window) try { await (await caches.open('reader-covers-v1')).put(cacheKey, new Response(blob, { headers: { 'content-type': blob.type } })); } catch (_) {}
-    }
-    coverBlobs.set(cacheKey, blob);
-    const url = URL.createObjectURL(blob);
-    coverUrls.add(url);
-    image.src = url;
-    image.onload = () => image.classList.add('loaded');
+      image.addEventListener('load', () => image.classList.add('loaded'));
+      image.addEventListener('error', () => image.remove());
+    });
   }
-
-  async function extractEpubCover(id) {
-    const response = await fetch(`/api/books/${id}/file`);
-    if (!response.ok) return null;
-    const packageData = await openEpubPackage(await response.arrayBuffer());
-    if (!packageData) return null;
-    const { zip, opf, opfPath } = packageData;
-    const items = localElements(opf, 'item');
-    const coverId = localElements(opf, 'meta').find(meta => meta.getAttribute('name') === 'cover')?.getAttribute('content');
-    const item = items.find(entry => entry.getAttribute('id') === coverId)
-      || items.find(entry => (entry.getAttribute('properties') || '').split(/\s+/).includes('cover-image'))
-      || items.find(entry => /(^|[/_.-])cover([/_.-]|$)/i.test(entry.getAttribute('href') || '') && /^image\//.test(entry.getAttribute('media-type') || ''));
-    if (!item) return null;
-    const path = resolvePath(opfPath, item.getAttribute('href') || '');
-    const file = zip.file(path);
-    if (!file) return null;
-    return new Blob([await file.async('arraybuffer')], { type: item.getAttribute('media-type') || imageMime(path) });
-  }
-
-  async function extractEpubMetadata(file) {
-    if (!window.JSZip || !file.name.toLocaleLowerCase().endsWith('.epub')) return null;
-    try {
-      const packageData = await openEpubPackage(await file.arrayBuffer());
-      if (!packageData) return null;
-      const metas = localElements(packageData.opf, 'meta');
-      const author = localElements(packageData.opf, 'creator')[0]?.textContent?.trim() || '';
-      let seriesName = metas.find(meta => meta.getAttribute('name') === 'calibre:series')?.getAttribute('content')?.trim() || '';
-      let seriesIndex = numberOrNull(metas.find(meta => meta.getAttribute('name') === 'calibre:series_index')?.getAttribute('content'));
-      if (!seriesName) {
-        const collection = metas.find(meta => meta.getAttribute('property') === 'belongs-to-collection' && meta.textContent.trim());
-        if (collection) {
-          const id = collection.getAttribute('id');
-          const refined = id ? metas.filter(meta => meta.getAttribute('refines') === `#${id}`) : [];
-          const type = refined.find(meta => meta.getAttribute('property') === 'collection-type')?.textContent.trim();
-          if (!type || type === 'series') {
-            seriesName = collection.textContent.trim();
-            seriesIndex = numberOrNull(refined.find(meta => meta.getAttribute('property') === 'group-position')?.textContent);
-          }
-        }
-      }
-      return { author, series_name: seriesName, series_index: seriesIndex };
-    } catch (_) { return null; }
-  }
-
-  async function openEpubPackage(buffer) {
-    const zip = await JSZip.loadAsync(buffer);
-    const container = zip.file('META-INF/container.xml');
-    if (!container) return null;
-    const rootfile = localElements(parseXml(await container.async('string')), 'rootfile')[0];
-    if (!rootfile) return null;
-    const opfPath = normalizePath(rootfile.getAttribute('full-path'));
-    const opfFile = zip.file(opfPath);
-    if (!opfFile) return null;
-    return { zip, opf: parseXml(await opfFile.async('string')), opfPath };
-  }
-
-  function parseXml(text) { return new DOMParser().parseFromString(text, 'application/xml'); }
-  function localElements(doc, name) { return Array.from(doc.getElementsByTagName('*')).filter(element => element.localName === name); }
-  function resolvePath(baseFile, relative) {
-    const clean = decodePath(String(relative).split('#')[0].split('?')[0]);
-    const base = clean.startsWith('/') ? [] : normalizePath(baseFile).split('/').slice(0, -1);
-    return normalizePath([...base, ...clean.split('/')].join('/'));
-  }
-  function normalizePath(path) {
-    const parts = [];
-    for (const part of String(path || '').replace(/^\//, '').split('/')) {
-      if (!part || part === '.') continue;
-      if (part === '..') parts.pop(); else parts.push(part);
-    }
-    return parts.join('/');
-  }
-  function decodePath(path) { try { return decodeURIComponent(path); } catch (_) { return path; } }
-  function imageMime(path) { const ext = path.split('.').pop().toLowerCase(); return ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : ext === 'svg' ? 'image/svg+xml' : 'image/jpeg'; }
-  function numberOrNull(value) { if (value == null || String(value).trim() === '') return null; const number = Number(value); return Number.isFinite(number) ? number : null; }
 
   // ---- 抽屉（书架工具） ----
   function openDrawer(push = true) {
@@ -443,14 +333,10 @@ window.Shelf = (function () {
   }
 
   async function uploadOne(file) {
-    const metadataPromise = extractEpubMetadata(file);
+    // 服务端在上传时解析 EPUB（封面/作者/系列/正文），前端不再做任何解析。
     const form = new FormData();
     form.append('book', file);
-    const book = await api('/api/books', { method: 'POST', body: form });
-    const metadata = await metadataPromise;
-    if (metadata && (metadata.author || metadata.series_name)) {
-      await api(`/api/books/${book.id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(metadata) });
-    }
+    await api('/api/books', { method: 'POST', body: form });
   }
 
   function coverColor(index, id) { const colors = ['#704b3b', '#465c54', '#314b64', '#80643b', '#643f4d', '#4f526d']; return colors[(index + id) % colors.length]; }
@@ -536,7 +422,6 @@ window.Shelf = (function () {
         toast('书籍信息已更新');
       } catch (error) { toast(error.message); }
     };
-    window.addEventListener('beforeunload', () => coverUrls.forEach(url => URL.revokeObjectURL(url)));
   }
 
   async function logout() { await api('/api/logout', { method: 'POST' }); location.reload(); }

@@ -9,14 +9,21 @@ async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 axum = { version = "0.8.9", features = ["multipart"] }
 encoding_rs = "0.8"
 hex = "0.4.3"
+imagesize = "0.13"
+percent-encoding = "2"
 r2d2 = "0.8"
 r2d2_sqlite = "0.31"
+regex = "1"
+roxmltree = "0.20"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+scraper = "0.23"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 uuid = { version = "1", features = ["v4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 strip = true
