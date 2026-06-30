@@ -21,6 +21,7 @@ window.ReaderApp = (function () {
   let progressSaveTimer = null;
   const PROGRESS_SAVE_DELAY = 1200; // 翻页停下这么久后才真正写一次，合并快速翻页的连续写入
   let resizeTimer = null;
+  let suppressZoneClick = 0; // 滑动翻页后短暂吞掉热区补发的 click，避免一次滑动翻两页/误切工具栏
 
   // state: { bookId, info, kind, contentNode, toc, tocEntries,
   //          currentPage, pageCount, pageWidth, pageHeight, restoreRatio }
@@ -62,9 +63,11 @@ window.ReaderApp = (function () {
   }
 
   function bindEvents() {
-    els.prevZone && (els.prevZone.onclick = previous);
-    els.centerZone && (els.centerZone.onclick = toggleTools);
-    els.nextZone && (els.nextZone.onclick = next);
+    const guardZone = handler => () => { if (Date.now() < suppressZoneClick) return; handler(); };
+    els.prevZone && (els.prevZone.onclick = guardZone(previous));
+    els.centerZone && (els.centerZone.onclick = guardZone(toggleTools));
+    els.nextZone && (els.nextZone.onclick = guardZone(next));
+    bindSwipe();
     els.tocButton && (els.tocButton.onclick = () => openToc());
     els.tocButton2 && (els.tocButton2.onclick = () => openToc());
     els.tocClose && (els.tocClose.onclick = () => closeToc());
@@ -98,6 +101,27 @@ window.ReaderApp = (function () {
     document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
     window.addEventListener('pagehide', flush);
     window.addEventListener('beforeunload', flush);
+  }
+
+  // 左右滑动翻页（无动画，直接跳页）。横向位移够大且明显大于纵向才算翻页，
+  // 否则当作点击/纵向手势放行。左滑=下一页，右滑=上一页，与点击热区方向一致。
+  function bindSwipe() {
+    if (!els.viewport) return;
+    let startX = 0, startY = 0, tracking = false;
+    els.viewport.addEventListener('touchstart', event => {
+      tracking = event.touches.length === 1;
+      if (tracking) { startX = event.touches[0].clientX; startY = event.touches[0].clientY; }
+    }, { passive: true });
+    els.viewport.addEventListener('touchend', event => {
+      if (!tracking) return;
+      tracking = false;
+      const touch = event.changedTouches[0];
+      const dx = touch.clientX - startX;
+      const dy = touch.clientY - startY;
+      if (Math.abs(dx) < 45 || Math.abs(dx) < Math.abs(dy) * 1.5) return; // 位移太小或偏纵向：不是翻页
+      suppressZoneClick = Date.now() + 500;
+      if (dx < 0) next(); else previous();
+    }, { passive: true });
   }
 
   function isVisible() {
