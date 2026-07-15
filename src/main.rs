@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt, BufReader}, net::TcpListener, sync::Semaphore};
 use tokio_util::io::ReaderStream;
+use tower_http::compression::CompressionLayer;
 use uuid::Uuid;
 
 mod epub;
@@ -40,6 +41,8 @@ const LOGIN_MAX_TRACKED_IPS: usize = 4096;
 // 同时进行的 Argon2 哈希数上限：每次哈希约占 19MB，限并发把内存峰值钉死在小盒子能承受的范围。
 const MAX_CONCURRENT_HASHES: usize = 2;
 const SECURITY_HEADER_CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+// 书籍内容/封面/图片按书籍 ID 不可变（重传=新 ID），让浏览器磁盘缓存一周；过期后凭 ETag 校验，未变则 304 免重传。
+const BOOK_CACHE_CONTROL: &str = "private, max-age=604800";
 
 #[derive(Clone)]
 struct AppState {
@@ -196,6 +199,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .fallback(spa_fallback)
         .layer(DefaultBodyLimit::max(MAX_BOOK_SIZE + 1024 * 1024))
         .layer(middleware::from_fn(security_headers))
+        // 响应压缩（gzip/zstd，按 Accept-Encoding 协商）：正文 JSON 是几 MB 的中文文本，压缩后通常只剩 1/3~1/5。
+        // 默认谓词会跳过图片等已压缩类型，封面/插图不受影响。
+        .layer(CompressionLayer::new())
         .with_state(state);
 
     let address = std::env::var("READER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
@@ -533,37 +539,65 @@ async fn book_content(State(state): State<AppState>, headers: HeaderMap, AxumPat
     let record = {
         let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
         db.query_row(
-            "SELECT kind, stored_name, parsed_at, toc_json FROM books WHERE id = ?1 AND user_id = ?2",
+            "SELECT kind, stored_name, parsed_at, toc_json, created_at FROM books WHERE id = ?1 AND user_id = ?2",
             params![id, user_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, i64>(4)?)),
         ).optional().map_err(|_| AppError::internal("读取书籍失败"))?
     }.ok_or_else(|| AppError(StatusCode::NOT_FOUND, "书籍不存在".into()))?;
-    let (kind, stored_name, parsed_at, toc_json) = record;
+    let (kind, stored_name, parsed_at, mut toc_json, created_at) = record;
+
+    // 版本戳：EPUB 以解析时间为准（重新解析＝内容变了），TXT 以入库时间为准（文件不可变）。
+    let stamp = if kind == "epub" {
+        ensure_parsed(&state, id, &kind, &stored_name, parsed_at).await?;
+        match parsed_at {
+            Some(stamp) => stamp,
+            None => {
+                // 懒解析后目录/解析时间才写进库，重新取一次。
+                let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
+                let (fresh_toc, fresh_parsed) = db.query_row(
+                    "SELECT toc_json, parsed_at FROM books WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                ).optional().map_err(|_| AppError::internal("读取书籍失败"))?.unwrap_or((None, None));
+                toc_json = fresh_toc;
+                fresh_parsed.unwrap_or(created_at)
+            }
+        }
+    } else {
+        created_at
+    };
+
+    // ETag 命中：直接 304，跳过读文件/解压，浏览器复用本地缓存，不再整本重传。
+    let etag = format!("W/\"{id}-{stamp}\"");
+    if headers.get(header::IF_NONE_MATCH).and_then(|value| value.to_str().ok()).is_some_and(|value| value == etag) {
+        let mut response = StatusCode::NOT_MODIFIED.into_response();
+        apply_book_cache_headers(response.headers_mut(), &etag)?;
+        return Ok(response);
+    }
 
     if kind == "epub" {
-        ensure_parsed(&state, id, &kind, &stored_name, parsed_at).await?;
-        // 懒解析后目录才写进库，重新取一次。
-        let toc_json = if parsed_at.is_some() {
-            toc_json
-        } else {
-            let db = state.db.get().map_err(|_| AppError::internal("数据库繁忙"))?;
-            db.query_row("SELECT toc_json FROM books WHERE id = ?1", params![id], |row| row.get::<_, Option<String>>(0))
-                .optional().map_err(|_| AppError::internal("读取书籍失败"))?.flatten()
-        };
         let html = fs::read_to_string(state.derived_dir.join(id.to_string()).join("content.html")).await
             .map_err(|_| AppError::internal("正文不存在，请重新上传该书"))?;
-        return content_response("epub", Some(html), None, toc_json);
+        return content_response("epub", Some(html), None, toc_json, &etag);
     }
 
     let text = read_txt_text(&state, &stored_name).await?;
     let toc = epub::extract_txt_toc(&text);
-    content_response("txt", None, Some(text), Some(toc))
+    content_response("txt", None, Some(text), Some(toc), &etag)
 }
 
-fn content_response(kind: &str, html: Option<String>, text: Option<String>, toc_json: Option<String>) -> AppResult<Response> {
+fn content_response(kind: &str, html: Option<String>, text: Option<String>, toc_json: Option<String>, etag: &str) -> AppResult<Response> {
     let toc = serde_json::value::RawValue::from_string(toc_json.unwrap_or_else(|| "[]".into()))
         .unwrap_or_else(|_| serde_json::value::RawValue::from_string("[]".into()).unwrap());
-    Ok(Json(ContentResponse { kind: kind.to_string(), html, text, toc }).into_response())
+    let mut response = Json(ContentResponse { kind: kind.to_string(), html, text, toc }).into_response();
+    apply_book_cache_headers(response.headers_mut(), etag)?;
+    Ok(response)
+}
+
+fn apply_book_cache_headers(headers: &mut HeaderMap, etag: &str) -> AppResult<()> {
+    headers.insert(header::ETAG, HeaderValue::from_str(etag).map_err(|_| AppError::internal("创建响应失败"))?);
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(BOOK_CACHE_CONTROL));
+    Ok(())
 }
 
 // 解压（或直读旧的未压缩）TXT 为字符串。
@@ -609,7 +643,7 @@ async fn book_cover(State(state): State<AppState>, headers: HeaderMap, AxumPath(
     let file = fs::File::open(&path).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "封面不存在".into()))?;
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, epub::asset_content_type(&ext))
-        .header(header::CACHE_CONTROL, "private, max-age=86400");
+        .header(header::CACHE_CONTROL, BOOK_CACHE_CONTROL);
     if let Ok(meta) = file.metadata().await {
         builder = builder.header(header::CONTENT_LENGTH, meta.len());
     }
@@ -642,7 +676,7 @@ async fn book_asset(State(state): State<AppState>, headers: HeaderMap, AxumPath(
     let file = fs::File::open(&path).await.map_err(|_| AppError(StatusCode::NOT_FOUND, "资源不存在".into()))?;
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, epub::asset_content_type(ext))
-        .header(header::CACHE_CONTROL, "private, max-age=86400");
+        .header(header::CACHE_CONTROL, BOOK_CACHE_CONTROL);
     if let Ok(meta) = file.metadata().await {
         builder = builder.header(header::CONTENT_LENGTH, meta.len());
     }
