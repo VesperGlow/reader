@@ -103,24 +103,64 @@ window.ReaderApp = (function () {
     window.addEventListener('beforeunload', flush);
   }
 
-  // 左右滑动翻页（无动画，直接跳页）。横向位移够大且明显大于纵向才算翻页，
-  // 否则当作点击/纵向手势放行。左滑=下一页，右滑=上一页，与点击热区方向一致。
+  // 左右滑动翻页（跟手拖动 + 松手吸附动画）。手指横向拖动时正文实时跟随，
+  // 松手后按"快速轻扫或拖过 1/4 屏"判定翻页，否则弹回原页；边缘页拖动加阻尼。
+  // 横向位移明显大于纵向才进入拖动，否则当作点击/纵向手势放行。
   function bindSwipe() {
     if (!els.viewport) return;
-    let startX = 0, startY = 0, tracking = false;
+    let startX = 0, startY = 0, startTime = 0, tracking = false, dragging = false;
+
+    const release = dx => {
+      const flick = Date.now() - startTime < 300 && Math.abs(dx) > 30; // 快速轻扫：距离短也算翻页
+      const shouldTurn = flick || Math.abs(dx) > active.pageStep * 0.25;
+      const target = active.currentPage + (dx < 0 ? 1 : -1);
+      if (shouldTurn && target >= 0 && target < active.pageCount) turnPage(dx < 0 ? 'next' : 'prev');
+      else goToPage(active, active.currentPage, true); // 不够翻页：动画弹回
+    };
+
     els.viewport.addEventListener('touchstart', event => {
-      tracking = event.touches.length === 1;
-      if (tracking) { startX = event.touches[0].clientX; startY = event.touches[0].clientY; }
+      tracking = event.touches.length === 1 && !!active;
+      dragging = false;
+      if (tracking) {
+        startX = event.touches[0].clientX;
+        startY = event.touches[0].clientY;
+        startTime = Date.now();
+      }
     }, { passive: true });
+
+    els.viewport.addEventListener('touchmove', event => {
+      if (!tracking) return;
+      if (event.touches.length !== 1) { tracking = false; if (dragging) goToPage(active, active.currentPage, true); return; }
+      const dx = event.touches[0].clientX - startX;
+      const dy = event.touches[0].clientY - startY;
+      if (!dragging) {
+        if (Math.abs(dx) < 8) return; // 起步死区：避免轻点抖动被当成拖动
+        if (Math.abs(dx) < Math.abs(dy) * 1.2) { tracking = false; return; } // 偏纵向：放行
+        dragging = true;
+        suppressZoneClick = Date.now() + 600;
+      }
+      const atEdge = (active.currentPage === 0 && dx > 0) || (active.currentPage >= active.pageCount - 1 && dx < 0);
+      setTransform(active, -active.currentPage * active.pageStep + (atEdge ? dx / 3 : dx), false);
+    }, { passive: true });
+
     els.viewport.addEventListener('touchend', event => {
       if (!tracking) return;
       tracking = false;
       const touch = event.changedTouches[0];
       const dx = touch.clientX - startX;
       const dy = touch.clientY - startY;
-      if (Math.abs(dx) < 45 || Math.abs(dx) < Math.abs(dy) * 1.5) return; // 位移太小或偏纵向：不是翻页
-      suppressZoneClick = Date.now() + 500;
-      if (dx < 0) next(); else previous();
+      if (!dragging) {
+        // 没进入拖动就抬手（如被 iOS 系统手势打断）：沿用旧的一次性判定兜底
+        if (Math.abs(dx) < 45 || Math.abs(dx) < Math.abs(dy) * 1.5) return;
+        suppressZoneClick = Date.now() + 500;
+      }
+      release(dx);
+    }, { passive: true });
+
+    els.viewport.addEventListener('touchcancel', () => {
+      if (!tracking) return;
+      tracking = false;
+      if (dragging) goToPage(active, active.currentPage, true);
     }, { passive: true });
   }
 
@@ -321,6 +361,7 @@ window.ReaderApp = (function () {
     node.style.columnWidth = `${Math.max(1, width - 2 * sidePad)}px`;
     node.style.columnGap = `${2 * sidePad}px`;
     node.style.columnFill = 'auto';
+    node.style.transition = 'none'; // 重排必须瞬时归位，不能沿用上次翻页残留的过渡
     node.style.transform = 'translateX(0px)';
     state.pageWidth = width;
     state.pageHeight = height;
@@ -329,10 +370,19 @@ window.ReaderApp = (function () {
     mapTocPages(state);
   }
 
-  function goToPage(state, index) {
+  function goToPage(state, index, animate = false) {
     state.currentPage = Math.min(Math.max(0, index), Math.max(0, state.pageCount - 1));
-    state.contentNode.style.transform = `translateX(${-state.currentPage * state.pageStep}px)`;
+    setTransform(state, -state.currentPage * state.pageStep, animate);
     updateTocActive();
+  }
+
+  // 所有 transform 写入的唯一出口：拖动时即时更新，翻页/回弹时带缓动过渡。
+  // animate 前先强制一次布局，确保过渡从"手指刚离开的位置"起步而不是上一帧。
+  function setTransform(state, x, animate) {
+    const node = state.contentNode;
+    if (animate) void node.offsetWidth;
+    node.style.transition = animate ? 'transform .26s cubic-bezier(.22,.72,.26,1)' : 'none';
+    node.style.transform = `translateX(${x}px)`;
   }
 
   function mapTocPages(state) {
@@ -372,7 +422,7 @@ window.ReaderApp = (function () {
     if (!active) return;
     const target = active.currentPage + (direction === 'next' ? 1 : -1);
     if (target < 0 || target >= active.pageCount) return;
-    goToPage(active, target);
+    goToPage(active, target, true);
     updatePageLabel();
     queueProgressSave(active.currentPage);
   }
